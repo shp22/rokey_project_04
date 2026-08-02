@@ -1,0 +1,31 @@
+# --- ROS2 / colcon build artifacts ---
+build/
+install/
+log/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- YOLO / ultralytics 학습 산출물 & 가중치 (용량 커서 git에는 비권장) ---
+runs/
+datasets/
+*.pt
+*.onnx
+*.engine
+*.cache
+
+# --- Claude Code local state ---
+.claude/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# --- ROS2 bag files ---
+*.bag
+*.db3
