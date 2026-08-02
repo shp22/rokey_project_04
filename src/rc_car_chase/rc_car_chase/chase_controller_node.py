@@ -11,6 +11,7 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PointStamped, Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CompressedImage, Image, LaserScan
+from std_msgs.msg import String
 from cv_bridge import CvBridge
 from ultralytics import YOLO
 
@@ -107,11 +108,13 @@ class ChaseControllerNode(Node):
         self.debug_pub = (
             self.create_publisher(Image, self.debug_image_topic, 1) if self.publish_debug_image else None
         )
+        self.phase_pub = self.create_publisher(String, self.phase_topic, reliable_qos)
 
         self.timer = self.create_timer(1.0 / self.control_rate_hz, self.on_control_timer, callback_group=cb_timer)
 
         self.get_logger().info(
-            f'chase_controller started: state={self.state}, enable_cmd_vel={self.enable_cmd_vel}'
+            f'chase_controller started: state={self.state}, enable_cmd_vel={self.enable_cmd_vel}, '
+            f'use_nav2_phase1={self.use_nav2_phase1}'
         )
 
     # ------------------------------------------------------------------ params
@@ -124,7 +127,7 @@ class ChaseControllerNode(Node):
             'webcam_target_topic': '/rc_car_chase/webcam_target',
             'odom_topic': '/robot5/odom',
             'own_cam_model_path':
-                '/home/rokey/rokey_ws/runs/detect/runs_train/car_dum_yolo11n_seqsplit/weights/best.pt',
+                '/home/rokey/b_4/runs/detect/runs_train/car_dum_yolo11n_seqsplit/weights/best.pt',
             'own_cam_conf_threshold': 0.5,
             'own_cam_confirm_conf': 0.6,
             'own_cam_confirm_frames': 4,
@@ -161,6 +164,8 @@ class ChaseControllerNode(Node):
             'show_window': False,
             'enable_cmd_vel': False,
             'initial_state': PHASE1_APPROACH,
+            'use_nav2_phase1': False,
+            'phase_topic': '/rc_car_chase/phase',
             'lidar_topic': '/robot5/scan',
             'lidar_front_half_angle': 0.44,
             'lidar_safety_stop_distance': 0.3,
@@ -214,6 +219,8 @@ class ChaseControllerNode(Node):
         self.show_window = g('show_window')
         self.enable_cmd_vel = g('enable_cmd_vel')
         self.initial_state = g('initial_state')
+        self.use_nav2_phase1 = g('use_nav2_phase1')
+        self.phase_topic = g('phase_topic')
         self.lidar_topic = g('lidar_topic')
         self.lidar_front_half_angle = g('lidar_front_half_angle')
         self.lidar_safety_stop_distance = g('lidar_safety_stop_distance')
@@ -302,10 +309,20 @@ class ChaseControllerNode(Node):
 
     def on_control_timer(self):
         now = self.get_clock().now()
+        self.phase_pub.publish(String(data=self.state))
+
         if self.state == PHASE1_APPROACH:
             twist = self.tick_phase1(now)
         else:
             twist = self.tick_phase2(now)
+
+        if twist is None:
+            # PHASE1 driving delegated to nav_goal_bridge_node + Nav2 (use_nav2_phase1=True) -
+            # this node stays hands-off so it doesn't fight Nav2's own cmd_vel publisher.
+            self.get_logger().info(
+                'PHASE1_APPROACH: nav2 owns cmd_vel, controller idle', throttle_duration_sec=2.0,
+            )
+            return
 
         twist = self._apply_lidar_safety(twist, now)
 
@@ -317,7 +334,7 @@ class ChaseControllerNode(Node):
                 f'ang={twist.angular.z:.3f}', throttle_duration_sec=1.0,
             )
 
-    def tick_phase1(self, now) -> Twist:
+    def tick_phase1(self, now):
         handoff_ok = self.own_cam_confirm_count >= self.own_cam_confirm_frames
         if handoff_ok and self.own_cam_handoff_max_depth_m > 0:
             z = self._sample_depth_at_bbox_center(now)
@@ -329,6 +346,11 @@ class ChaseControllerNode(Node):
             self.state = PHASE2_FOLLOW
             self.search_start_time = None
             return Twist()
+
+        if self.use_nav2_phase1:
+            # nav_goal_bridge_node reads latest_webcam_target via /rc_car_chase/webcam_target
+            # directly and drives through Nav2; nothing left for this node to do until handoff.
+            return None
 
         if (self.latest_webcam_target is None or self.latest_webcam_stamp is None
                 or (now - self.latest_webcam_stamp) > Duration(seconds=self.webcam_stale_timeout)):

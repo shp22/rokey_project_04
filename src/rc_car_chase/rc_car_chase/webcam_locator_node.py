@@ -14,20 +14,21 @@ class WebcamLocatorNode(Node):
     def __init__(self):
         super().__init__('webcam_locator_node')
 
-        self.declare_parameter('device', '/dev/video2')
+        self.declare_parameter('device', '/dev/video2')     # 웹캠 카메라
         self.declare_parameter('capture_width', 640)
-        self.declare_parameter('capture_height', 480)
-        self.declare_parameter('capture_fps', 30.0)
-        self.declare_parameter('model_path', '/home/rokey/rokey_ws/best_v11.pt')
-        self.declare_parameter('conf_threshold', 0.5)
-        self.declare_parameter('tracker', 'bytetrack.yaml')
-        self.declare_parameter('target_class_id', 0)
-        self.declare_parameter('homography_yaml_path',
-                                '/home/rokey/rokey_ws/src/rc_car_chase/config/webcam_homography.yaml')
-        self.declare_parameter('target_topic', '/rc_car_chase/webcam_target')
-        self.declare_parameter('overlay_topic', '/rc_car_chase/webcam_debug_image')
-        self.declare_parameter('publish_overlay', True)
-        self.declare_parameter('show_window', True)
+        self.declare_parameter('capture_height', 480)       # 웹캠 이미지 680 x 480
+        self.declare_parameter('capture_fps', 30.0)         # 30 FPS
+        self.declare_parameter('model_path', '/home/rokey/b_4/src/rc_car_chase/best_v11.pt')    # 검출 YOLO 모델
+        self.declare_parameter('conf_threshold', 0.5)       # 검출 신뢰도
+        self.declare_parameter('tracker', 'bytetrack.yaml') # 동일한 객체를 추적
+        self.declare_parameter('target_class_id', 0)        # 추적할 타겟의 ID
+        self.declare_parameter('homography_yaml_path',      # 호모그래피 행렬 파일 경로
+                                '/home/rokey/b_4/src/rc_car_chase/config/webcam_homography.yaml')
+        self.declare_parameter('target_topic', '/rc_car_chase/webcam_target')       # RC카의 3D 좌표 발행 토픽
+        self.declare_parameter('overlay_topic', '/rc_car_chase/webcam_debug_image') # YOLO 박스 / 칼만 필터/ 3D 변환 좌표 등을 그린 이미지 발행 토픽
+        self.declare_parameter('publish_overlay', True)     # 이미지 발행하기
+        self.declare_parameter('show_window', True)         # 탕 띄우기
+        self.declare_parameter('odom_frame_id', 'odom')
 
         device = self.get_parameter('device').value
         capture_width = self.get_parameter('capture_width').value
@@ -42,6 +43,7 @@ class WebcamLocatorNode(Node):
         overlay_topic = self.get_parameter('overlay_topic').value
         self.publish_overlay = self.get_parameter('publish_overlay').value
         self.show_window = self.get_parameter('show_window').value
+        self.odom_frame_id = self.get_parameter('odom_frame_id').value
 
         try:
             self.homography = load_homography_yaml(homography_yaml_path)
@@ -61,14 +63,14 @@ class WebcamLocatorNode(Node):
         if not self.cap.isOpened():
             raise RuntimeError(f'Could not open webcam device {device}')
 
-        qos = QoSProfile(depth=1)
+        qos = QoSProfile(depth=1)       # 큐(버퍼) 저장 데이터 개수
         qos.reliability = ReliabilityPolicy.RELIABLE
         qos.history = HistoryPolicy.KEEP_LAST
 
-        self.target_pub = self.create_publisher(PointStamped, target_topic, qos)
-        self.overlay_pub = self.create_publisher(Image, overlay_topic, 1) if self.publish_overlay else None
+        self.target_pub = self.create_publisher(PointStamped, target_topic, qos)        # RC카 3D 좌표 퍼블리시
+        self.overlay_pub = self.create_publisher(Image, overlay_topic, 1) if self.publish_overlay else None     # 이미지 퍼블리시
 
-        self.locked_track_id = None
+        self.locked_track_id = None     # 추적할 RC카의 ID
         self.frame_count = 0
 
         self.timer = self.create_timer(1.0 / capture_fps, self.on_timer)
@@ -88,7 +90,7 @@ class WebcamLocatorNode(Node):
         if self.frame_count % 30 == 1:
             self.get_logger().info(f'webcam: processed {self.frame_count} frames')
 
-        results = self.model.track(
+        results = self.model.track(         # 동일한 객체 추적하기 -> 바운딩 박스, ID, 신뢰도, 시각화/디버깅
             frame, persist=True, conf=self.conf_threshold,
             tracker=self.tracker_cfg, verbose=False,
         )
@@ -104,7 +106,7 @@ class WebcamLocatorNode(Node):
 
             msg = PointStamped()
             msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = 'odom'
+            msg.header.frame_id = self.odom_frame_id
             msg.point.x = x
             msg.point.y = y
             msg.point.z = 0.0

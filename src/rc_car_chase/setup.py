@@ -30,6 +30,7 @@ setup(
         'console_scripts': [
             'webcam_locator_node = rc_car_chase.webcam_locator_node:main',
             'chase_controller_node = rc_car_chase.chase_controller_node:main',
+            'nav_goal_bridge_node = rc_car_chase.nav_goal_bridge_node:main',
             'calibrate_webcam_homography = rc_car_chase.calibrate_webcam_homography:main',
         ],
     },

@@ -1,0 +1,33 @@
+homography_matrix:
+- -0.001442859415475056
+- 0.0027332540939770016
+- -1.1199667263804096
+- 0.001633222956674453
+- -0.00024055539219437357
+- -3.07245312139905
+- 0.00029930097743204905
+- 0.0012999317106336522
+- 1.0
+frame_id: odom
+calibrated_at: '2026-08-02T15:19:30.773341'
+num_points: 4
+pixel_points:
+- - 548.0
+  - 294.0
+- - 217.0
+  - 359.0
+- - 445.0
+  - 446.0
+- - 171.0
+  - 182.0
+world_points:
+- - -0.716
+  - -1.454
+- - -0.295
+  - -1.831
+- - -0.317
+  - -1.432
+- - -0.675
+  - -2.203
+note: Homography is only valid for the robot odom origin active at calibration time.
+  Recalibrate after any robot reboot / odom reset, or if the webcam is moved.

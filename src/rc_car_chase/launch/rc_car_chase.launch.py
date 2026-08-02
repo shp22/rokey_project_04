@@ -7,14 +7,14 @@ from launch_ros.actions import Node
 def generate_launch_description():
     args = [
         DeclareLaunchArgument('webcam_device', default_value='/dev/video2'),
-        DeclareLaunchArgument('webcam_model_path', default_value='/home/rokey/rokey_ws/best_v11.pt'),
+        DeclareLaunchArgument('webcam_model_path', default_value='/home/rokey/b_4/src/rc_car_chase/best_v11.pt'),
         DeclareLaunchArgument(
             'homography_yaml_path',
-            default_value='/home/rokey/rokey_ws/src/rc_car_chase/config/webcam_homography.yaml',
+            default_value='/home/rokey/b_4/src/rc_car_chase/config/webcam_homography.yaml',
         ),
         DeclareLaunchArgument(
             'own_cam_model_path',
-            default_value='/home/rokey/rokey_ws/runs/detect/runs_train/car_dum_yolo11n_seqsplit/weights/best.pt',
+            default_value='/home/rokey/b_4/runs/detect/runs_train/car_dum_yolo11n_seqsplit/weights/best.pt',
         ),
         DeclareLaunchArgument('target_distance', default_value='0.35'),
         DeclareLaunchArgument('own_cam_confirm_frames', default_value='4'),
