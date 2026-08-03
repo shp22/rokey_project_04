@@ -60,11 +60,15 @@ class ChaseControllerNode(Node):
         self.latest_depth_image = None
         self.latest_depth_stamp = None
         self.latest_lidar_min_front = None
+        self.latest_lidar_min_left = float('inf')
+        self.latest_lidar_min_right = float('inf')
         self.latest_lidar_stamp = None
         self.own_cam_confirm_count = 0
         self.locked_track_id = None
         self.last_known_bearing_sign = 1
         self.search_start_time = None
+        self.last_known_heading_sign = 1
+        self.phase1_search_start_time = None
         self._depth_debug_printed = False
         self.frame_count = 0
 
@@ -166,6 +170,8 @@ class ChaseControllerNode(Node):
             'lidar_safety_stop_distance': 0.3,
             'lidar_stale_timeout': 1.0,
             'lidar_forward_offset_rad': 0.0,
+            'lidar_avoid_trigger_distance': 0.6,
+            'lidar_avoid_kp': 1.5,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -219,6 +225,8 @@ class ChaseControllerNode(Node):
         self.lidar_safety_stop_distance = g('lidar_safety_stop_distance')
         self.lidar_stale_timeout = g('lidar_stale_timeout')
         self.lidar_forward_offset_rad = g('lidar_forward_offset_rad')
+        self.lidar_avoid_trigger_distance = g('lidar_avoid_trigger_distance')
+        self.lidar_avoid_kp = g('lidar_avoid_kp')
 
     # --------------------------------------------------------------- callbacks
 
@@ -234,13 +242,21 @@ class ChaseControllerNode(Node):
 
     def on_lidar(self, msg: LaserScan):
         front = []
+        left_min = float('inf')
+        right_min = float('inf')
         angle = msg.angle_min
         for r in msg.ranges:
             a = normalize_angle(angle - self.lidar_forward_offset_rad)
             if abs(a) <= self.lidar_front_half_angle and math.isfinite(r) and r > 0.01:
                 front.append(r)
+                if a >= 0.0:
+                    left_min = min(left_min, r)
+                else:
+                    right_min = min(right_min, r)
             angle += msg.angle_increment
         self.latest_lidar_min_front = min(front) if front else float('inf')
+        self.latest_lidar_min_left = left_min
+        self.latest_lidar_min_right = right_min
         self.latest_lidar_stamp = self.get_clock().now()
 
     def on_oakd_synced(self, rgb_msg: CompressedImage, depth_msg: CompressedImage):
@@ -306,6 +322,7 @@ class ChaseControllerNode(Node):
             twist = self.tick_phase1(now)
         else:
             twist = self.tick_phase2(now)
+            twist = self._apply_lidar_avoidance(twist, now)
 
         twist = self._apply_lidar_safety(twist, now)
 
@@ -330,10 +347,14 @@ class ChaseControllerNode(Node):
             self.search_start_time = None
             return Twist()
 
-        if (self.latest_webcam_target is None or self.latest_webcam_stamp is None
-                or (now - self.latest_webcam_stamp) > Duration(seconds=self.webcam_stale_timeout)):
-            self.get_logger().warn('webcam target stale/absent - holding still', throttle_duration_sec=2.0)
+        if self.latest_webcam_target is None:
+            self.get_logger().warn('webcam target never received - holding still', throttle_duration_sec=2.0)
             return Twist()
+
+        if not self._webcam_target_fresh(now):
+            return self._phase1_search_twist(now)
+
+        self.phase1_search_start_time = None
 
         if (self.latest_odom_xy is None or self.latest_odom_stamp is None
                 or (now - self.latest_odom_stamp) > Duration(seconds=self.odom_stale_timeout)):
@@ -344,11 +365,28 @@ class ChaseControllerNode(Node):
         dy = self.latest_webcam_target.y - self.latest_odom_xy[1]
         target_heading = math.atan2(dy, dx)
         heading_error = normalize_angle(target_heading - self.latest_odom_yaw)
+        self.last_known_heading_sign = 1 if heading_error >= 0 else -1
 
         twist = Twist()
         twist.angular.z = clamp(self.phase1_kp_ang * heading_error, -self.phase1_max_ang, self.phase1_max_ang)
         forward_scale = max(0.0, math.cos(heading_error))
         twist.linear.x = clamp(self.phase1_forward_speed * forward_scale, 0.0, self.phase1_max_lin)
+        return twist
+
+    def _phase1_search_twist(self, now) -> Twist:
+        if self.phase1_search_start_time is None:
+            self.phase1_search_start_time = now
+            self.get_logger().warn('webcam target stale - starting rotate-search (PHASE1)')
+
+        if (now - self.phase1_search_start_time) > Duration(seconds=self.search_timeout_sec):
+            self.get_logger().error(
+                'webcam search timed out - stopping and waiting for re-acquisition',
+                throttle_duration_sec=5.0,
+            )
+            return Twist()
+
+        twist = Twist()
+        twist.angular.z = self.search_ang_speed * self.last_known_heading_sign
         return twist
 
     def tick_phase2(self, now) -> Twist:
@@ -423,6 +461,19 @@ class ChaseControllerNode(Node):
         x1, y1, x2, y2 = self.latest_own_cam_bbox
         u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
         return sample_depth_patch(self.latest_depth_image, u, v, self.depth_patch_size, self.depth_scale)
+
+    def _apply_lidar_avoidance(self, twist: Twist, now) -> Twist:
+        if (self.latest_lidar_stamp is None
+                or (now - self.latest_lidar_stamp) > Duration(seconds=self.lidar_stale_timeout)):
+            return twist
+        if self.latest_lidar_min_front >= self.lidar_avoid_trigger_distance:
+            return twist
+        span = self.lidar_avoid_trigger_distance - self.lidar_safety_stop_distance
+        closeness = clamp((self.lidar_avoid_trigger_distance - self.latest_lidar_min_front) / span, 0.0, 1.0)
+        imbalance = clamp(self.latest_lidar_min_right - self.latest_lidar_min_left, -1.0, 1.0)
+        bias = -self.lidar_avoid_kp * closeness * imbalance
+        twist.angular.z = clamp(twist.angular.z + bias, -self.phase2_max_ang, self.phase2_max_ang)
+        return twist
 
     def _apply_lidar_safety(self, twist: Twist, now) -> Twist:
         if (self.latest_lidar_min_front is None or self.latest_lidar_stamp is None
