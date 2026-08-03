@@ -3,14 +3,18 @@ import math
 import cv2
 import message_filters
 import rclpy
+from action_msgs.msg import GoalStatus
+from rclpy.action import ActionClient
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PointStamped, Twist
-from nav_msgs.msg import Odometry
+from nav2_msgs.action import NavigateToPose
 from sensor_msgs.msg import CompressedImage, Image, LaserScan
+from std_msgs.msg import Bool
+from visualization_msgs.msg import Marker
 from cv_bridge import CvBridge
 from ultralytics import YOLO
 
@@ -18,6 +22,10 @@ from rc_car_chase.vision_utils import decode_compressed_depth, sample_depth_patc
 
 PHASE1_APPROACH = 'PHASE1_APPROACH'
 PHASE2_FOLLOW = 'PHASE2_FOLLOW'
+
+SUB_MODE_IDLE = 'IDLE'
+SUB_MODE_EXPLORING = 'EXPLORING'
+SUB_MODE_NAVIGATING = 'NAVIGATING_TO_TARGET'
 
 
 def clamp(value, lo, hi):
@@ -30,10 +38,6 @@ def normalize_angle(angle):
     while angle < -math.pi:
         angle += 2.0 * math.pi
     return angle
-
-
-def quaternion_to_yaw(q):
-    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
 
 class ChaseControllerNode(Node):
@@ -51,9 +55,6 @@ class ChaseControllerNode(Node):
         self.state = self.initial_state
         self.latest_webcam_target = None
         self.latest_webcam_stamp = None
-        self.latest_odom_xy = None
-        self.latest_odom_yaw = None
-        self.latest_odom_stamp = None
         self.latest_own_cam_bbox = None
         self.latest_own_cam_conf = None
         self.latest_own_cam_stamp = None
@@ -68,6 +69,13 @@ class ChaseControllerNode(Node):
         self._depth_debug_printed = False
         self.frame_count = 0
 
+        # ---- Nav2 / explore_lite state ----
+        self._nav2_goal_handle = None
+        self._nav2_goal_pending = False
+        self._nav2_last_goal_xy = None
+        self._phase1_sub_mode = None
+        self._explore_resume_published = None
+
         reliable_qos = QoSProfile(depth=1)
         reliable_qos.reliability = ReliabilityPolicy.RELIABLE
         reliable_qos.history = HistoryPolicy.KEEP_LAST
@@ -81,6 +89,7 @@ class ChaseControllerNode(Node):
         cb_light = MutuallyExclusiveCallbackGroup()
         cb_vision = MutuallyExclusiveCallbackGroup()
         cb_lidar = MutuallyExclusiveCallbackGroup()
+        cb_nav2 = MutuallyExclusiveCallbackGroup()
         cb_timer = MutuallyExclusiveCallbackGroup()
 
         self.create_subscription(
@@ -88,16 +97,16 @@ class ChaseControllerNode(Node):
             callback_group=cb_light,
         )
         self.create_subscription(
-            Odometry, self.odom_topic, self.on_odom, reliable_qos,
-            callback_group=cb_light,
-        )
-        self.create_subscription(
             LaserScan, self.lidar_topic, self.on_lidar, reliable_qos,
             callback_group=cb_lidar,
         )
 
-        rgb_sub = message_filters.Subscriber(self, CompressedImage, self.own_cam_rgb_topic, qos_profile=reliable_qos)
-        depth_sub = message_filters.Subscriber(self, CompressedImage, self.own_cam_depth_topic, qos_profile=depth_qos)
+        rgb_sub = message_filters.Subscriber(
+            self, CompressedImage, self.own_cam_rgb_topic, qos_profile=reliable_qos, callback_group=cb_vision,
+        )
+        depth_sub = message_filters.Subscriber(
+            self, CompressedImage, self.own_cam_depth_topic, qos_profile=depth_qos, callback_group=cb_vision,
+        )
         self._sync = message_filters.ApproximateTimeSynchronizer(
             [rgb_sub, depth_sub], queue_size=5, slop=self.rgb_depth_sync_slop,
         )
@@ -107,11 +116,17 @@ class ChaseControllerNode(Node):
         self.debug_pub = (
             self.create_publisher(Image, self.debug_image_topic, 1) if self.publish_debug_image else None
         )
+        self.explore_resume_pub = self.create_publisher(Bool, self.explore_resume_topic, reliable_qos)
+        self.handoff_event_pub = self.create_publisher(Marker, self.handoff_event_topic, 1)
+        self.nav2_action_client = ActionClient(
+            self, NavigateToPose, self.nav2_action_name, callback_group=cb_nav2,
+        )
 
         self.timer = self.create_timer(1.0 / self.control_rate_hz, self.on_control_timer, callback_group=cb_timer)
 
         self.get_logger().info(
-            f'chase_controller started: state={self.state}, enable_cmd_vel={self.enable_cmd_vel}'
+            f'chase_controller started: state={self.state}, enable_cmd_vel={self.enable_cmd_vel}, '
+            f'enable_autonomous_exploration={self.enable_autonomous_exploration}'
         )
 
     # ------------------------------------------------------------------ params
@@ -122,31 +137,25 @@ class ChaseControllerNode(Node):
             'own_cam_depth_topic': '/robot5/oakd/stereo/image_raw/compressedDepth',
             'cmd_vel_topic': '/robot5/cmd_vel',
             'webcam_target_topic': '/rc_car_chase/webcam_target',
-            'odom_topic': '/robot5/odom',
             'own_cam_model_path':
                 '/home/rokey/rokey_ws/runs/detect/runs_train/car_dum_yolo11n_seqsplit/weights/best.pt',
             'own_cam_conf_threshold': 0.5,
             'own_cam_confirm_conf': 0.6,
             'own_cam_confirm_frames': 4,
-            'own_cam_handoff_max_depth_m': 3.0,
+            'own_cam_handoff_max_depth_m': 0.7,
             'tracker': 'bytetrack.yaml',
             'target_class_id': 0,
-            'target_distance': 0.35,
+            'target_distance': 0.5,
             'distance_deadband': 0.03,
             'depth_scale': 0.001,
             'depth_patch_size': 5,
             'depth_stale_timeout': 0.5,
             'detection_loss_timeout': 1.5,
             'webcam_stale_timeout': 1.0,
-            'odom_stale_timeout': 1.0,
             'depth_qos_best_effort': False,
             'rgb_depth_sync_slop': 0.1,
             'fx': 565.6582641601562,
             'cx': 355.6732177734375,
-            'phase1_kp_ang': 0.8,
-            'phase1_max_ang': 0.6,
-            'phase1_forward_speed': 0.12,
-            'phase1_max_lin': 0.15,
             'phase2_kp_ang': 1.0,
             'phase2_max_ang': 0.6,
             'phase2_kp_lin': 0.5,
@@ -166,6 +175,12 @@ class ChaseControllerNode(Node):
             'lidar_safety_stop_distance': 0.3,
             'lidar_stale_timeout': 1.0,
             'lidar_forward_offset_rad': 0.0,
+            'nav2_action_name': '/robot5/navigate_to_pose',
+            'explore_resume_topic': '/robot5/explore/resume',
+            'handoff_event_topic': '/rc_car_chase/handoff_event',
+            'nav2_goal_update_threshold_m': 0.3,
+            'nav2_goal_frame_id': 'odom',
+            'enable_autonomous_exploration': False,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -176,7 +191,6 @@ class ChaseControllerNode(Node):
         self.own_cam_depth_topic = g('own_cam_depth_topic')
         self.cmd_vel_topic = g('cmd_vel_topic')
         self.webcam_target_topic = g('webcam_target_topic')
-        self.odom_topic = g('odom_topic')
         self.own_cam_model_path = g('own_cam_model_path')
         self.own_cam_conf_threshold = g('own_cam_conf_threshold')
         self.own_cam_confirm_conf = g('own_cam_confirm_conf')
@@ -191,15 +205,10 @@ class ChaseControllerNode(Node):
         self.depth_stale_timeout = g('depth_stale_timeout')
         self.detection_loss_timeout = g('detection_loss_timeout')
         self.webcam_stale_timeout = g('webcam_stale_timeout')
-        self.odom_stale_timeout = g('odom_stale_timeout')
         self.depth_qos_best_effort = g('depth_qos_best_effort')
         self.rgb_depth_sync_slop = g('rgb_depth_sync_slop')
         self.fx = g('fx')
         self.cx = g('cx')
-        self.phase1_kp_ang = g('phase1_kp_ang')
-        self.phase1_max_ang = g('phase1_max_ang')
-        self.phase1_forward_speed = g('phase1_forward_speed')
-        self.phase1_max_lin = g('phase1_max_lin')
         self.phase2_kp_ang = g('phase2_kp_ang')
         self.phase2_max_ang = g('phase2_max_ang')
         self.phase2_kp_lin = g('phase2_kp_lin')
@@ -219,18 +228,18 @@ class ChaseControllerNode(Node):
         self.lidar_safety_stop_distance = g('lidar_safety_stop_distance')
         self.lidar_stale_timeout = g('lidar_stale_timeout')
         self.lidar_forward_offset_rad = g('lidar_forward_offset_rad')
+        self.nav2_action_name = g('nav2_action_name')
+        self.explore_resume_topic = g('explore_resume_topic')
+        self.handoff_event_topic = g('handoff_event_topic')
+        self.nav2_goal_update_threshold_m = g('nav2_goal_update_threshold_m')
+        self.nav2_goal_frame_id = g('nav2_goal_frame_id')
+        self.enable_autonomous_exploration = g('enable_autonomous_exploration')
 
     # --------------------------------------------------------------- callbacks
 
     def on_webcam_target(self, msg: PointStamped):
         self.latest_webcam_target = msg.point
         self.latest_webcam_stamp = self.get_clock().now()
-
-    def on_odom(self, msg: Odometry):
-        p = msg.pose.pose.position
-        self.latest_odom_xy = (p.x, p.y)
-        self.latest_odom_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
-        self.latest_odom_stamp = self.get_clock().now()
 
     def on_lidar(self, msg: LaserScan):
         front = []
@@ -303,10 +312,10 @@ class ChaseControllerNode(Node):
     def on_control_timer(self):
         now = self.get_clock().now()
         if self.state == PHASE1_APPROACH:
-            twist = self.tick_phase1(now)
-        else:
-            twist = self.tick_phase2(now)
+            self.tick_phase1(now)
+            return
 
+        twist = self.tick_phase2(now)
         twist = self._apply_lidar_safety(twist, now)
 
         if self.enable_cmd_vel:
@@ -317,7 +326,7 @@ class ChaseControllerNode(Node):
                 f'ang={twist.angular.z:.3f}', throttle_duration_sec=1.0,
             )
 
-    def tick_phase1(self, now) -> Twist:
+    def tick_phase1(self, now):
         handoff_ok = self.own_cam_confirm_count >= self.own_cam_confirm_frames
         if handoff_ok and self.own_cam_handoff_max_depth_m > 0:
             z = self._sample_depth_at_bbox_center(now)
@@ -326,30 +335,29 @@ class ChaseControllerNode(Node):
 
         if handoff_ok:
             self.get_logger().info('HANDOFF: own camera confirmed car -> PHASE2_FOLLOW')
+            self._publish_handoff_event()
+            self._cancel_nav2_goal_if_active()
             self.state = PHASE2_FOLLOW
             self.search_start_time = None
-            return Twist()
+            return
 
-        if (self.latest_webcam_target is None or self.latest_webcam_stamp is None
-                or (now - self.latest_webcam_stamp) > Duration(seconds=self.webcam_stale_timeout)):
-            self.get_logger().warn('webcam target stale/absent - holding still', throttle_duration_sec=2.0)
-            return Twist()
+        webcam_fresh = (
+            self.latest_webcam_target is not None and self.latest_webcam_stamp is not None
+            and (now - self.latest_webcam_stamp) <= Duration(seconds=self.webcam_stale_timeout)
+        )
 
-        if (self.latest_odom_xy is None or self.latest_odom_stamp is None
-                or (now - self.latest_odom_stamp) > Duration(seconds=self.odom_stale_timeout)):
-            self.get_logger().warn('odom stale/absent - holding still', throttle_duration_sec=2.0)
-            return Twist()
-
-        dx = self.latest_webcam_target.x - self.latest_odom_xy[0]
-        dy = self.latest_webcam_target.y - self.latest_odom_xy[1]
-        target_heading = math.atan2(dy, dx)
-        heading_error = normalize_angle(target_heading - self.latest_odom_yaw)
-
-        twist = Twist()
-        twist.angular.z = clamp(self.phase1_kp_ang * heading_error, -self.phase1_max_ang, self.phase1_max_ang)
-        forward_scale = max(0.0, math.cos(heading_error))
-        twist.linear.x = clamp(self.phase1_forward_speed * forward_scale, 0.0, self.phase1_max_lin)
-        return twist
+        if webcam_fresh:
+            self._enter_phase1_sub_mode(SUB_MODE_NAVIGATING)
+            self._set_explore_resume(False)
+            self._maybe_send_nav2_goal(self.latest_webcam_target.x, self.latest_webcam_target.y)
+        elif self.enable_autonomous_exploration:
+            self._enter_phase1_sub_mode(SUB_MODE_EXPLORING)
+            self._cancel_nav2_goal_if_active()
+            self._set_explore_resume(True)
+        else:
+            self._enter_phase1_sub_mode(SUB_MODE_IDLE)
+            self._cancel_nav2_goal_if_active()
+            self._set_explore_resume(False)
 
     def tick_phase2(self, now) -> Twist:
         have_detection = (
@@ -416,6 +424,127 @@ class ChaseControllerNode(Node):
                 )
             twist.linear.x = min(twist.linear.x, 0.0)
         return twist
+
+    def _publish_handoff_event(self):
+        """Fire a brief RViz marker at the robot's own location when PHASE1 -> PHASE2
+        handoff happens, so the transition is visible in the visualization instead of
+        only showing up in the log."""
+        now_msg = self.get_clock().now().to_msg()
+        flash_lifetime = Duration(seconds=2.0).to_msg()
+
+        sphere = Marker()
+        sphere.header.frame_id = 'base_link'
+        sphere.header.stamp = now_msg
+        sphere.ns = 'rc_car_chase/handoff'
+        sphere.id = 0
+        sphere.type = Marker.SPHERE
+        sphere.action = Marker.ADD
+        sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.4
+        sphere.color.r, sphere.color.g, sphere.color.b, sphere.color.a = (1.0, 0.85, 0.0, 0.85)
+        sphere.lifetime = flash_lifetime
+        self.handoff_event_pub.publish(sphere)
+
+        text = Marker()
+        text.header.frame_id = 'base_link'
+        text.header.stamp = now_msg
+        text.ns = 'rc_car_chase/handoff'
+        text.id = 1
+        text.type = Marker.TEXT_VIEW_FACING
+        text.action = Marker.ADD
+        text.pose.position.z = 0.5
+        text.scale.z = 0.3
+        text.color.r, text.color.g, text.color.b, text.color.a = (1.0, 1.0, 1.0, 1.0)
+        text.text = 'HANDOFF: PHASE2_FOLLOW'
+        text.lifetime = flash_lifetime
+        self.handoff_event_pub.publish(text)
+
+    # -------------------------------------------------------- Nav2 / explore
+
+    def _enter_phase1_sub_mode(self, name):
+        if self._phase1_sub_mode != name:
+            self.get_logger().info(f'PHASE1 sub-mode -> {name}')
+            self._phase1_sub_mode = name
+
+    def _set_explore_resume(self, want_resume: bool):
+        if not self.enable_cmd_vel:
+            want_resume = False  # dry-run: never let explore_lite actually drive
+        if want_resume == self._explore_resume_published:
+            return
+        self.explore_resume_pub.publish(Bool(data=want_resume))
+        self._explore_resume_published = want_resume
+        self.get_logger().info(f'EXPLORE: resume={want_resume}')
+
+    def _maybe_send_nav2_goal(self, x, y):
+        if self._nav2_goal_pending:
+            return  # still waiting on accept/reject for a previous send
+
+        if self._nav2_last_goal_xy is not None:
+            moved = math.hypot(x - self._nav2_last_goal_xy[0], y - self._nav2_last_goal_xy[1])
+            if moved < self.nav2_goal_update_threshold_m:
+                return  # target hasn't moved enough - let the current goal keep running
+
+        if not self.enable_cmd_vel:
+            self.get_logger().info(
+                f'[DRY RUN] would send nav2 goal to ({x:.2f}, {y:.2f})', throttle_duration_sec=1.0,
+            )
+            self._nav2_last_goal_xy = (x, y)
+            return
+
+        self._send_nav2_goal(x, y)
+
+    def _send_nav2_goal(self, x, y):
+        if not self.nav2_action_client.server_is_ready():
+            self.get_logger().warn('nav2 action server not ready yet, skipping goal', throttle_duration_sec=2.0)
+            return
+
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = self.nav2_goal_frame_id
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = x
+        goal_msg.pose.pose.position.y = y
+        goal_msg.pose.pose.orientation.w = 1.0
+
+        self._nav2_goal_pending = True
+        self._nav2_last_goal_xy = (x, y)
+        self.get_logger().info(f'NAV2: sending goal to ({x:.2f}, {y:.2f})')
+        send_future = self.nav2_action_client.send_goal_async(goal_msg)
+        send_future.add_done_callback(self._on_nav2_goal_response)
+
+    def _on_nav2_goal_response(self, future):
+        self._nav2_goal_pending = False
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self.get_logger().error(f'nav2 send_goal_async failed: {exc}')
+            return
+        if not goal_handle.accepted:
+            self.get_logger().warn('NAV2: goal rejected')
+            return
+        self._nav2_goal_handle = goal_handle
+        goal_handle.get_result_async().add_done_callback(self._on_nav2_result)
+
+    def _on_nav2_result(self, future):
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.get_logger().error(f'nav2 get_result_async failed: {exc}')
+            return
+        status_name = {
+            GoalStatus.STATUS_SUCCEEDED: 'SUCCEEDED',
+            GoalStatus.STATUS_CANCELED: 'CANCELED',
+            GoalStatus.STATUS_ABORTED: 'ABORTED',
+        }.get(result.status, str(result.status))
+        self.get_logger().info(f'NAV2: goal finished, status={status_name}')
+
+    def _cancel_nav2_goal_if_active(self):
+        if self._nav2_goal_handle is not None:
+            cancel_future = self._nav2_goal_handle.cancel_goal_async()
+            cancel_future.add_done_callback(
+                lambda f: self.get_logger().info('NAV2: cancel request completed')
+            )
+        self._nav2_goal_handle = None
+        self._nav2_goal_pending = False
+        self._nav2_last_goal_xy = None
 
     # ------------------------------------------------------------------ misc
 

@@ -1,0 +1,81 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Class: rviz_default_plugins/Grid
+      Enabled: true
+      Name: Grid
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Name: TF
+      Show Names: true
+      Value: true
+    - Alpha: 0.7
+      Class: rviz_default_plugins/Map
+      Enabled: true
+      Name: Map
+      Topic:
+        Value: /robot5/map
+      Value: true
+    - Class: rviz_default_plugins/LaserScan
+      Color: 255; 0; 0
+      Enabled: true
+      Name: LaserScan
+      Size (m): 0.05
+      Style: Flat Squares
+      Topic:
+        Value: /robot5/scan
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: HandoffEvent
+      Topic:
+        Value: /rc_car_chase/handoff_event
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: OwnCamDebug
+      Topic:
+        Value: /rc_car_chase/debug_image
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: false
+      Name: WebcamDebug
+      Topic:
+        Value: /rc_car_chase/webcam_debug_image
+      Value: false
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: map
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 10
+      Name: Current View
+      Target Frame: <Fixed Frame>
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 900
+  OwnCamDebug:
+    collapsed: false
+  Views:
+    collapsed: false
+  WebcamDebug:
+    collapsed: false
+  Width: 1400
