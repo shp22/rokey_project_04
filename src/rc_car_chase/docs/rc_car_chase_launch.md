@@ -20,7 +20,10 @@ launch 인자(`DeclareLaunchArgument`)로 노출해서 커맨드라인에서 바
 | `own_cam_confirm_frames` | `4` | chase_controller_node | 핸드오프에 필요한 연속 확인 프레임 수 |
 | `detection_loss_timeout` | `1.5` | chase_controller_node | 탐지 유실 판정 시간 |
 | `phase2_max_lin` / `phase2_max_ang` | `0.15` / `0.6` | chase_controller_node | PHASE2 최대 속도 |
-| `lidar_safety_stop_distance` | `0.3` | chase_controller_node | 라이다 안전 정지 거리 (PHASE2에만 적용, PHASE1은 Nav2 costmap이 담당) |
+| `phase2_ff_gain_ang` / `phase2_ff_gain_lin` | `0.0` / `0.0` | chase_controller_node | PHASE2 bearing/range 변화율 피드포워드 게인 (기본 0=비활성) |
+| `lidar_safety_stop_distance` | `0.6` | chase_controller_node | 라이다 하드정지 거리 (PHASE2에만 적용, PHASE1은 Nav2 costmap이 담당) |
+| `lidar_avoid_trigger_distance` | `0.9` | chase_controller_node | PHASE2 조향 회피가 시작되는 거리 (하드정지보다 커야 함) |
+| `odom_topic` | `/robot5/odom` | chase_controller_node | PHASE2 피드포워드 자기운동 보정용 오도메트리 토픽 |
 | `enable_cmd_vel` | `false` | chase_controller_node | **실제 발행 여부 (SAFE DEFAULT 주석대로 기본은 항상 false)**. Nav2 목표 전송 및 explore resume도 함께 억제됨 |
 | `initial_state` | `PHASE1_APPROACH` | chase_controller_node | 시작 상태 |
 | `webcam_show_window` | `true` | webcam_locator_node → `show_window` | 웹캠 디버그 창 표시 |

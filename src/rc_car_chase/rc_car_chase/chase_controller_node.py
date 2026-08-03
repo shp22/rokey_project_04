@@ -10,10 +10,12 @@ from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
 from geometry_msgs.msg import PointStamped, Twist
 from irobot_create_msgs.action import Undock
 from irobot_create_msgs.msg import DockStatus
 from nav2_msgs.action import NavigateToPose
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CompressedImage, Image, LaserScan
 from std_msgs.msg import Bool
 from visualization_msgs.msg import Marker
@@ -64,6 +66,8 @@ class ChaseControllerNode(Node):
         self.latest_depth_image = None
         self.latest_depth_stamp = None
         self.latest_lidar_min_front = None
+        self.latest_lidar_min_left = float('inf')
+        self.latest_lidar_min_right = float('inf')
         self.latest_lidar_stamp = None
         self.own_cam_confirm_count = 0
         self.locked_track_id = None
@@ -73,6 +77,17 @@ class ChaseControllerNode(Node):
         self.frame_count = 0
         self.latest_is_docked = None
         self.latest_dock_stamp = None
+
+        # ---- PHASE2 feedforward state (bearing/range rate-of-change estimates) ----
+        self.latest_bearing_angle = None
+        self.prev_bearing_angle = None
+        self.prev_bearing_time = None
+        self.bearing_rate_est = 0.0
+        self.prev_range_m = None
+        self.prev_range_time = None
+        self.range_rate_est = 0.0
+        self.latest_odom_yaw_rate = 0.0
+        self.latest_odom_lin_vel = 0.0
 
         # ---- Nav2 / explore_lite state ----
         self._nav2_goal_handle = None
@@ -108,6 +123,10 @@ class ChaseControllerNode(Node):
         )
         self.create_subscription(
             DockStatus, self.dock_status_topic, self.on_dock_status, reliable_qos,
+            callback_group=cb_light,
+        )
+        self.create_subscription(
+            Odometry, self.odom_topic, self.on_odom, reliable_qos,
             callback_group=cb_light,
         )
 
@@ -175,6 +194,10 @@ class ChaseControllerNode(Node):
             'phase2_max_lin': 0.15,
             'phase2_max_lin_reverse': 0.08,
             'allow_reverse': True,
+            'phase2_ff_gain_ang': 0.0,
+            'phase2_ff_gain_lin': 0.0,
+            'ff_smoothing_alpha': 0.3,
+            'odom_topic': '/robot5/odom',
             'search_ang_speed': 0.3,
             'search_timeout_sec': 15.0,
             'control_rate_hz': 10.0,
@@ -185,7 +208,9 @@ class ChaseControllerNode(Node):
             'initial_state': PHASE1_APPROACH,
             'lidar_topic': '/robot5/scan',
             'lidar_front_half_angle': 0.44,
-            'lidar_safety_stop_distance': 0.3,
+            'lidar_safety_stop_distance': 0.6,
+            'lidar_avoid_trigger_distance': 0.9,
+            'lidar_avoid_kp': 1.5,
             'lidar_stale_timeout': 1.0,
             'lidar_forward_offset_rad': 0.0,
             'nav2_action_name': '/robot5/navigate_to_pose',
@@ -231,6 +256,10 @@ class ChaseControllerNode(Node):
         self.phase2_max_lin = g('phase2_max_lin')
         self.phase2_max_lin_reverse = g('phase2_max_lin_reverse')
         self.allow_reverse = g('allow_reverse')
+        self.phase2_ff_gain_ang = g('phase2_ff_gain_ang')
+        self.phase2_ff_gain_lin = g('phase2_ff_gain_lin')
+        self.ff_smoothing_alpha = g('ff_smoothing_alpha')
+        self.odom_topic = g('odom_topic')
         self.search_ang_speed = g('search_ang_speed')
         self.search_timeout_sec = g('search_timeout_sec')
         self.control_rate_hz = g('control_rate_hz')
@@ -242,6 +271,8 @@ class ChaseControllerNode(Node):
         self.lidar_topic = g('lidar_topic')
         self.lidar_front_half_angle = g('lidar_front_half_angle')
         self.lidar_safety_stop_distance = g('lidar_safety_stop_distance')
+        self.lidar_avoid_trigger_distance = g('lidar_avoid_trigger_distance')
+        self.lidar_avoid_kp = g('lidar_avoid_kp')
         self.lidar_stale_timeout = g('lidar_stale_timeout')
         self.lidar_forward_offset_rad = g('lidar_forward_offset_rad')
         self.nav2_action_name = g('nav2_action_name')
@@ -264,15 +295,29 @@ class ChaseControllerNode(Node):
         self.latest_is_docked = msg.is_docked
         self.latest_dock_stamp = self.get_clock().now()
 
+    def on_odom(self, msg: Odometry):
+        # only used for PHASE2 feedforward ego-motion compensation - read the robot's
+        # own reported twist directly rather than differentiating pose ourselves.
+        self.latest_odom_yaw_rate = msg.twist.twist.angular.z
+        self.latest_odom_lin_vel = msg.twist.twist.linear.x
+
     def on_lidar(self, msg: LaserScan):
         front = []
+        left_min = float('inf')
+        right_min = float('inf')
         angle = msg.angle_min
         for r in msg.ranges:
             a = normalize_angle(angle - self.lidar_forward_offset_rad)
             if abs(a) <= self.lidar_front_half_angle and math.isfinite(r) and r > 0.01:
                 front.append(r)
+                if a >= 0.0:
+                    left_min = min(left_min, r)
+                else:
+                    right_min = min(right_min, r)
             angle += msg.angle_increment
         self.latest_lidar_min_front = min(front) if front else float('inf')
+        self.latest_lidar_min_left = left_min
+        self.latest_lidar_min_right = right_min
         self.latest_lidar_stamp = self.get_clock().now()
 
     def on_oakd_synced(self, rgb_msg: CompressedImage, depth_msg: CompressedImage):
@@ -317,9 +362,14 @@ class ChaseControllerNode(Node):
                 self.own_cam_confirm_count = min(self.own_cam_confirm_count + 1, self.own_cam_confirm_frames)
             else:
                 self.own_cam_confirm_count = 0
+
+            self.latest_bearing_angle = math.atan2(u_center - self.cx, self.fx)
+            self._update_bearing_rate_estimate(now)
+            self._update_range_rate_estimate(self._sample_depth_at_bbox_center(now), now)
         else:
             self.locked_track_id = None
             self.own_cam_confirm_count = 0
+            self._reset_feedforward_state()
 
         if self.publish_debug_image:
             overlay = results[0].plot()
@@ -339,6 +389,7 @@ class ChaseControllerNode(Node):
             return
 
         twist = self.tick_phase2(now)
+        twist = self._apply_lidar_avoidance(twist, now)
         twist = self._apply_lidar_safety(twist, now)
 
         if self.enable_cmd_vel:
@@ -395,24 +446,24 @@ class ChaseControllerNode(Node):
             return self._search_twist(now)
 
         self.search_start_time = None
-        x1, _, x2, _ = self.latest_own_cam_bbox
-        u_center = (x1 + x2) / 2.0
-        bearing_angle = math.atan2(u_center - self.cx, self.fx)
+        bearing_angle = self.latest_bearing_angle
 
         twist = Twist()
-        twist.angular.z = clamp(-self.phase2_kp_ang * bearing_angle, -self.phase2_max_ang, self.phase2_max_ang)
+        ang_cmd = -self.phase2_kp_ang * bearing_angle + self.phase2_ff_gain_ang * self.bearing_rate_est
+        twist.angular.z = clamp(ang_cmd, -self.phase2_max_ang, self.phase2_max_ang)
 
         z = self._sample_depth_at_bbox_center(now)
         if z is None:
             twist.linear.x = 0.0
         else:
             err = z - self.target_distance
+            ff_lin = self.phase2_ff_gain_lin * self.range_rate_est
             if abs(err) < self.distance_deadband:
                 twist.linear.x = 0.0
             elif err > 0:
-                twist.linear.x = clamp(self.phase2_kp_lin * err, 0.0, self.phase2_max_lin)
+                twist.linear.x = clamp(self.phase2_kp_lin * err + ff_lin, 0.0, self.phase2_max_lin)
             elif self.allow_reverse:
-                twist.linear.x = clamp(self.phase2_kp_lin * err, -self.phase2_max_lin_reverse, 0.0)
+                twist.linear.x = clamp(self.phase2_kp_lin * err + ff_lin, -self.phase2_max_lin_reverse, 0.0)
             else:
                 twist.linear.x = 0.0
         return twist
@@ -438,6 +489,58 @@ class ChaseControllerNode(Node):
         x1, y1, x2, y2 = self.latest_own_cam_bbox
         u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
         return sample_depth_patch(self.latest_depth_image, u, v, self.depth_patch_size, self.depth_scale)
+
+    def _update_bearing_rate_estimate(self, now):
+        """EMA-smoothed d(bearing)/dt, compensated for the robot's own yaw rate so the
+        estimate reflects the target's motion rather than our own rotation."""
+        if self.prev_bearing_time is not None:
+            dt = (now - self.prev_bearing_time).nanoseconds * 1e-9
+            if dt > 1e-3:
+                raw_rate = (
+                    normalize_angle(self.latest_bearing_angle - self.prev_bearing_angle) / dt
+                    + self.latest_odom_yaw_rate
+                )
+                a = self.ff_smoothing_alpha
+                self.bearing_rate_est = a * raw_rate + (1.0 - a) * self.bearing_rate_est
+        self.prev_bearing_angle = self.latest_bearing_angle
+        self.prev_bearing_time = now
+
+    def _update_range_rate_estimate(self, range_m, now):
+        """EMA-smoothed d(range)/dt, compensated for the robot's own forward speed."""
+        if range_m is not None and self.prev_range_time is not None:
+            dt = (now - self.prev_range_time).nanoseconds * 1e-9
+            if dt > 1e-3:
+                raw_rate = (range_m - self.prev_range_m) / dt + self.latest_odom_lin_vel
+                a = self.ff_smoothing_alpha
+                self.range_rate_est = a * raw_rate + (1.0 - a) * self.range_rate_est
+        if range_m is not None:
+            self.prev_range_m = range_m
+            self.prev_range_time = now
+
+    def _reset_feedforward_state(self):
+        self.prev_bearing_angle = None
+        self.prev_bearing_time = None
+        self.bearing_rate_est = 0.0
+        self.prev_range_m = None
+        self.prev_range_time = None
+        self.range_rate_est = 0.0
+
+    def _apply_lidar_avoidance(self, twist: Twist, now) -> Twist:
+        """Steer away from whichever side (left/right) is closer once an obstacle enters
+        lidar_avoid_trigger_distance, instead of just hard-stopping at lidar_safety_stop_distance."""
+        if (self.latest_lidar_stamp is None
+                or (now - self.latest_lidar_stamp) > Duration(seconds=self.lidar_stale_timeout)):
+            return twist
+        if self.latest_lidar_min_front >= self.lidar_avoid_trigger_distance:
+            return twist
+        span = self.lidar_avoid_trigger_distance - self.lidar_safety_stop_distance
+        if span <= 0:
+            return twist  # misconfigured (trigger <= stop distance) - skip, hard stop still applies
+        closeness = clamp((self.lidar_avoid_trigger_distance - self.latest_lidar_min_front) / span, 0.0, 1.0)
+        imbalance = clamp(self.latest_lidar_min_right - self.latest_lidar_min_left, -1.0, 1.0)
+        bias = -self.lidar_avoid_kp * closeness * imbalance
+        twist.angular.z = clamp(twist.angular.z + bias, -self.phase2_max_ang, self.phase2_max_ang)
+        return twist
 
     def _apply_lidar_safety(self, twist: Twist, now) -> Twist:
         if (self.latest_lidar_min_front is None or self.latest_lidar_stamp is None
@@ -533,18 +636,22 @@ class ChaseControllerNode(Node):
 
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = self.nav2_goal_frame_id
-        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        # Zero stamp (rather than "now") tells tf2 to use the latest available transform
+        # instead of the one at this exact instant - if the goal message itself sits in a
+        # congested DDS queue for a while before Nav2 processes it, a "now" stamp can fall
+        # outside the TF buffer's retention window by the time it's looked up, causing an
+        # immediate extrapolation-error ABORT even though the goal was fine when sent.
+        goal_msg.pose.header.stamp = Time().to_msg()
         goal_msg.pose.pose.position.x = x
         goal_msg.pose.pose.position.y = y
         goal_msg.pose.pose.orientation.w = 1.0
 
         self._nav2_goal_pending = True
-        self._nav2_last_goal_xy = (x, y)
         self.get_logger().info(f'NAV2: sending goal to ({x:.2f}, {y:.2f})')
         send_future = self.nav2_action_client.send_goal_async(goal_msg)
-        send_future.add_done_callback(self._on_nav2_goal_response)
+        send_future.add_done_callback(lambda f: self._on_nav2_goal_response(f, x, y))
 
-    def _on_nav2_goal_response(self, future):
+    def _on_nav2_goal_response(self, future, x, y):
         self._nav2_goal_pending = False
         try:
             goal_handle = future.result()
@@ -552,8 +659,11 @@ class ChaseControllerNode(Node):
             self.get_logger().error(f'nav2 send_goal_async failed: {exc}')
             return
         if not goal_handle.accepted:
+            # do NOT record (x, y) as the last-sent goal here - a rejected goal must not
+            # suppress the next attempt via the goal-update-threshold check below.
             self.get_logger().warn('NAV2: goal rejected')
             return
+        self._nav2_last_goal_xy = (x, y)
         self._nav2_goal_handle = goal_handle
         goal_handle.get_result_async().add_done_callback(self._on_nav2_result)
 
@@ -647,7 +757,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

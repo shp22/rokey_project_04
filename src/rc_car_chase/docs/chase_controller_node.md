@@ -108,6 +108,10 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 | `phase2_max_lin` | `0.15` | 최대 전진 속도 |
 | `phase2_max_lin_reverse` | `0.08` | 최대 후진 속도 |
 | `allow_reverse` | `True` | 너무 가까우면 후진 허용 여부 |
+| `phase2_ff_gain_ang` | `0.0` | bearing 변화율 추정치(`bearing_rate_est`)에 곱하는 피드포워드 게인. 기본 0=비활성 |
+| `phase2_ff_gain_lin` | `0.0` | 거리 변화율 추정치(`range_rate_est`)에 곱하는 피드포워드 게인. 기본 0=비활성 |
+| `ff_smoothing_alpha` | `0.3` | bearing/range rate 추정에 쓰는 EMA 평활 계수(1에 가까울수록 노이즈에 민감) |
+| `odom_topic` | `/robot5/odom` | PHASE2 피드포워드의 자기운동(ego-motion) 보정에만 쓰는 오도메트리 토픽 (PHASE1은 여전히 Nav2에 위임, odom 직접 안 씀) |
 
 ### 2-9. 탐색(search) / 실행 제어
 
@@ -126,7 +130,9 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 | 파라미터명 | 기본값 | 설명 |
 |---|---|---|
 | `lidar_front_half_angle` | `0.44` (rad) | 정면으로 간주할 각도 범위(±) |
-| `lidar_safety_stop_distance` | `0.3` (m) | 이보다 가까운 장애물이 있으면 전진 금지 |
+| `lidar_safety_stop_distance` | `0.6` (m) | 이보다 가까운 장애물이 있으면 전진 금지 (PHASE2 하드정지) |
+| `lidar_avoid_trigger_distance` | `0.9` (m) | PHASE2 전용 조향 회피가 시작되는 거리. `lidar_safety_stop_distance`보다 커야 하드정지 전에 비킬 여유가 생김 |
+| `lidar_avoid_kp` | `1.5` | 좌/우 최소거리 차이(m) → 조향 바이어스(rad/s) 변환 게인 |
 | `lidar_forward_offset_rad` | `0.0` | 라이다 정면 기준 보정 오프셋 (라이다 장착 각도 보정용) |
 
 ---
@@ -139,7 +145,12 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 | `self.latest_webcam_target`, `self.latest_webcam_stamp` | `on_webcam_target` | 웹캠이 알려준 최신 타겟 좌표와 수신 시각 |
 | `self.latest_own_cam_bbox`, `self.latest_own_cam_conf`, `self.latest_own_cam_stamp` | `on_oakd_synced` | 자체 카메라 최신 타겟 바운딩박스/신뢰도/시각 |
 | `self.latest_depth_image`, `self.latest_depth_stamp` | `on_oakd_synced` | 최신 디코딩된 뎁스 이미지와 시각 |
-| `self.latest_lidar_min_front`, `self.latest_lidar_stamp` | `on_lidar` | 전방 최소 거리와 시각 |
+| `self.latest_lidar_min_front`, `self.latest_lidar_stamp` | `on_lidar` | 전방 콘 전체 최소 거리와 시각 |
+| `self.latest_lidar_min_left`, `self.latest_lidar_min_right` | `on_lidar` | 전방 콘을 좌/우로 나눈 각각의 최소 거리 (PHASE2 조향 회피 판단용) |
+| `self.latest_bearing_angle` | `on_oakd_synced` | 최신 bearing angle (탐지 없으면 이전 값 유지, `tick_phase2`/피드포워드가 사용) |
+| `self.prev_bearing_angle`, `self.prev_bearing_time`, `self.bearing_rate_est` | `_update_bearing_rate_estimate` | bearing 변화율 EMA 추정 상태 |
+| `self.prev_range_m`, `self.prev_range_time`, `self.range_rate_est` | `_update_range_rate_estimate` | 거리 변화율 EMA 추정 상태 |
+| `self.latest_odom_yaw_rate`, `self.latest_odom_lin_vel` | `on_odom` | 로봇 자신의 각속도/선속도 (피드포워드 추정 시 자기운동 보정용) |
 | `self.own_cam_confirm_count` | `on_oakd_synced` | 고신뢰도 연속 탐지 카운트 (핸드오프 판단용) |
 | `self.locked_track_id` | `on_oakd_synced` | 현재 고정 추적 중인 ByteTrack ID |
 | `self.last_known_bearing_sign` | `on_oakd_synced` | 마지막으로 타겟이 화면 좌/우 어디 있었는지 (+1/-1) — 놓쳤을 때 탐색 회전 방향 결정 |
@@ -172,18 +183,23 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 |---|---|---|
 | `on_webcam_target(msg)` | cb_light | 웹캠 타겟 좌표 캐싱 |
 | `on_dock_status(msg)` | cb_light | 도킹 상태(`is_docked`)와 수신 시각 캐싱 |
-| `on_lidar(msg)` | cb_lidar | 스캔 전체 중 **정면 반각(`lidar_front_half_angle`) 범위 + 유효 거리(finite, >0.01m)**만 걸러서 최소값 저장. `lidar_forward_offset_rad`로 정면 기준 보정 |
+| `on_lidar(msg)` | cb_lidar | 스캔 전체 중 **정면 반각(`lidar_front_half_angle`) 범위 + 유효 거리(finite, >0.01m)**만 걸러서 전체 최소값 + 좌/우 각각의 최소값 저장. `lidar_forward_offset_rad`로 정면 기준 보정 |
+| `on_odom(msg)` | cb_light | `msg.twist.twist`에서 각속도/선속도를 그대로 캐싱 (pose 적분 없음 — PHASE2 피드포워드 자기운동 보정 전용, PHASE1엔 안 씀) |
 | `on_oakd_synced(rgb_msg, depth_msg)` | cb_vision (message_filters 동기화 콜백) | 아래 "5. `on_oakd_synced` 상세" 참고 |
 
 ### 제어 루프
 
 | 함수 | 기능 |
 |---|---|
-| `on_control_timer` | 매 `1/control_rate_hz` 초마다 실행. `PHASE1_APPROACH`면 `tick_phase1`만 호출하고 리턴(Nav2가 주행을 대신하므로 여기서 twist 발행 안 함); 그 외(PHASE2)는 `tick_phase2`로 twist를 만들고 `_apply_lidar_safety` 적용 → `enable_cmd_vel=True`면 실제 발행, 아니면 `[DRY RUN]` 로그만 출력 |
+| `on_control_timer` | 매 `1/control_rate_hz` 초마다 실행. `PHASE1_APPROACH`면 `tick_phase1`만 호출하고 리턴(Nav2가 주행을 대신하므로 여기서 twist 발행 안 함); 그 외(PHASE2)는 `tick_phase2`로 twist를 만들고 `_apply_lidar_avoidance`(조향 회피) → `_apply_lidar_safety`(하드정지) 순으로 적용 → `enable_cmd_vel=True`면 실제 발행, 아니면 `[DRY RUN]` 로그만 출력 |
 | `tick_phase1(now)` | **PHASE1 로직**: 핸드오프 조건(아래 참고) 확인 → 만족하면 `_publish_handoff_event()`로 RViz 이벤트 마커 발행 후 진행 중인 Nav2 목표 취소하고 PHASE2로 전환 후 리턴. 아니면 웹캠 타겟 신선도로 분기: 신선하고 `auto_undock=True`이며 아직 도킹 상태면 `UNDOCKING` 하위모드로 들어가 언도킹 goal 전송(`_maybe_send_undock_goal`); 신선하고 (언도킹 불필요하면) `NAVIGATING_TO_TARGET` 하위모드로 들어가 explore resume을 끄고 그 좌표로 Nav2 목표 전송(`_maybe_send_nav2_goal`); 신선하지 않고 `enable_autonomous_exploration=True`면 `EXPLORING`로 들어가 Nav2 목표 취소 + explore resume 켬; 둘 다 아니면 `IDLE`로 들어가 Nav2 목표 취소 + explore resume 끔 |
-| `tick_phase2(now)` | **PHASE2 로직**: 최근 탐지가 없으면 `_search_twist` 호출 → 있으면 바운딩박스 중심의 bearing angle로 각속도 계산, 뎁스로 거리 오차 계산해 전진/후진(데드밴드, 후진 허용 여부 반영) |
+| `tick_phase2(now)` | **PHASE2 로직**: 최근 탐지가 없으면 `_search_twist` 호출 → 있으면 `latest_bearing_angle`로 각속도 계산(`+ phase2_ff_gain_ang * bearing_rate_est` 피드포워드 항 포함), 뎁스로 거리 오차 계산해 전진/후진(데드밴드, 후진 허용 여부, `+ phase2_ff_gain_lin * range_rate_est` 피드포워드 항 반영) |
 | `_search_twist(now)` | 타겟을 놓쳤을 때: 처음 놓친 시각 기록 → `search_timeout_sec` 초과 시 정지+에러로그 → 아니면 `last_known_bearing_sign` 방향으로 제자리 회전 |
 | `_sample_depth_at_bbox_center(now)` | 현재 바운딩박스 중심 픽셀에서 뎁스 패치 샘플링 (`vision_utils.sample_depth_patch` 호출). 뎁스가 stale하거나 없으면 `None` |
+| `_update_bearing_rate_estimate(now)` | bearing angle의 변화율을 EMA로 추정, 로봇 자신의 `latest_odom_yaw_rate`를 더해 자기운동을 보정 (`ff_smoothing_alpha`로 평활) |
+| `_update_range_rate_estimate(range_m, now)` | 거리(뎁스)의 변화율을 EMA로 추정, 로봇 자신의 `latest_odom_lin_vel`을 더해 자기운동을 보정 |
+| `_reset_feedforward_state()` | 타겟을 놓쳤을 때 위 rate 추정 상태를 전부 초기화 (묵은 값으로 튀는 것 방지) |
+| `_apply_lidar_avoidance(twist, now)` | PHASE2 전용. 전방 최소거리가 `lidar_avoid_trigger_distance` 안으로 들어오면, 좌/우 최소거리 차이(`imbalance`)와 근접도(`closeness`)로 조향 바이어스를 계산해 `twist.angular.z`에 더함 — **정지 대신 먼 쪽으로 비켜감**. `lidar_safety_stop_distance`보다 가까워지면 이 함수와 별개로 `_apply_lidar_safety`가 전진을 마저 막음 |
 | `_apply_lidar_safety(twist, now)` | 라이다 데이터가 신선하고 전방 최소거리가 안전거리 미만이면 전진 속도를 0 이하로 clamp (후진은 허용). 라이다 데이터가 없거나 오래되면 **안전layer를 건너뜀** (막지 않음). PHASE1은 Nav2 자체 costmap이 장애물을 처리하므로 이 함수는 PHASE2 twist에만 적용됨 |
 | `_publish_handoff_event()` | PHASE1→PHASE2 전환 순간 `base_link` 프레임 기준으로 노란 구(SPHERE) + `"HANDOFF: PHASE2_FOLLOW"` 텍스트(TEXT_VIEW_FACING) 마커를 `handoff_event_topic`에 발행 (수명 2초짜리 일회성 플래시, RViz의 Marker 디스플레이로 시각적으로 확인 가능) |
 
@@ -194,8 +210,8 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 | `_enter_phase1_sub_mode(name)` | PHASE1 하위 모드가 바뀔 때만 `self._phase1_sub_mode` 갱신 + 로그 (매 틱마다 로그 스팸 방지) |
 | `_set_explore_resume(want_resume)` | `explore_resume_topic`에 `Bool` 발행. `enable_cmd_vel=False`(dry-run)면 항상 `False`로 강제 (explore_lite가 실수로 실제 주행하는 것 방지). 이전과 값이 같으면 재발행 안 함 |
 | `_maybe_send_nav2_goal(x, y)` | 아직 이전 목표의 accept/reject 응답 대기 중이면 스킵. 마지막으로 보낸 목표에서 `nav2_goal_update_threshold_m`만큼 안 움직였으면 스킵(리플랜 최소화). `enable_cmd_vel=False`면 실제 전송 없이 `[DRY RUN]` 로그만. 그 외엔 `_send_nav2_goal` 호출 |
-| `_send_nav2_goal(x, y)` | 액션 서버 준비 안 됐으면 경고 후 스킵. **진행 중인 이전 goal이 있으면 새로 보내기 전에 먼저 취소**(Nav2의 암묵적 preempt에 기대지 않고 우리 쪽 goal handle 상태를 명확하게 유지). `nav2_goal_frame_id` 기준 `PoseStamped`(orientation은 항상 정면 `w=1.0`)를 만들어 `NavigateToPose.Goal`로 비동기 전송, 응답 콜백(`_on_nav2_goal_response`) 등록 |
-| `_on_nav2_goal_response(future)` | 전송 실패/거부 시 로그만 남기고 종료. 수락되면 `goal_handle` 저장하고 결과 콜백(`_on_nav2_result`) 등록 |
+| `_send_nav2_goal(x, y)` | 액션 서버 준비 안 됐으면 경고 후 스킵. **진행 중인 이전 goal이 있으면 새로 보내기 전에 먼저 취소**(Nav2의 암묵적 preempt에 기대지 않고 우리 쪽 goal handle 상태를 명확하게 유지). `nav2_goal_frame_id` 기준 `PoseStamped`(orientation은 항상 정면 `w=1.0`)를 만들어 `NavigateToPose.Goal`로 비동기 전송, 응답 콜백(`_on_nav2_goal_response`) 등록. **`header.stamp`는 일부러 0(`Time()`)으로 둠** — "지금 이 순간"으로 못박으면, 메시지가 DDS 큐에서 지연되다 도착했을 때 그 시각이 이미 TF 버퍼 보관기간(수십 초)을 벗어나 즉시 extrapolation 에러로 ABORT될 수 있음. 0으로 두면 tf2가 "최신 변환을 써라"로 해석해서 이 문제를 피함 |
+| `_on_nav2_goal_response(future, x, y)` | 전송 실패/거부 시 로그만 남기고 종료 — **이때 `_nav2_last_goal_xy`를 갱신하지 않음** (거부된 좌표가 "마지막으로 보낸 목표"로 남아 이후 재전송이 막히는 걸 방지). 수락되면 그제서야 `_nav2_last_goal_xy = (x, y)` 기록, `goal_handle` 저장하고 결과 콜백(`_on_nav2_result`) 등록 |
 | `_on_nav2_result(future)` | 목표 완료 시 상태(`SUCCEEDED`/`CANCELED`/`ABORTED`/기타)를 로그로 출력 |
 | `_cancel_nav2_goal_if_active()` | 진행 중인 Nav2 목표가 있으면 비동기 취소 요청 후 goal handle/pending/last-goal 상태를 모두 초기화 |
 | `_maybe_send_undock_goal()` | 이전 언도킹 goal 응답/결과를 기다리는 중이면 스킵. `enable_cmd_vel=False`면 `[DRY RUN]` 로그만. 액션 서버 준비 안 됐으면 경고. 그 외엔 `Undock.Goal()`을 비동기 전송(`_on_undock_goal_response` 등록) — day3_pkg의 `TurtleBot4Navigator.undock()`과 같은 액션을 쓰지만, 그건 내부적으로 `rclpy.spin_until_future_complete`로 **블로킹**하는 방식이라 이 노드의 비동기 타이머/콜백 구조에 안 맞아 raw `ActionClient` + 콜백으로 직접 구현함 |
@@ -220,8 +236,8 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 3. 뎁스 디코딩 성공 시, **최초 1회만** dtype/min/max/nonzero_min을 로그로 출력해서 `depth_scale` 파라미터가 실제 데이터 단위와 맞는지 검증할 수 있게 함
 4. `own_cam_model.track()`으로 YOLO+ByteTrack 추론
 5. `select_target_box`로 최종 타겟 박스 선택
-   - 있으면: bbox/신뢰도/시각 캐싱, bbox 중심 x좌표로 좌/우 부호(`last_known_bearing_sign`) 갱신, 신뢰도가 `own_cam_confirm_conf` 이상이면 `own_cam_confirm_count` 증가(최대 `own_cam_confirm_frames`), 아니면 리셋
-   - 없으면: 락 해제, 카운트 리셋
+   - 있으면: bbox/신뢰도/시각 캐싱, bbox 중심 x좌표로 좌/우 부호(`last_known_bearing_sign`) 갱신, 신뢰도가 `own_cam_confirm_conf` 이상이면 `own_cam_confirm_count` 증가(최대 `own_cam_confirm_frames`), 아니면 리셋. `latest_bearing_angle` 갱신 후 `_update_bearing_rate_estimate`/`_update_range_rate_estimate`로 피드포워드 상태 갱신
+   - 없으면: 락 해제, 카운트 리셋, `_reset_feedforward_state`로 피드포워드 상태 초기화
 6. `publish_debug_image=True`면 오버레이 이미지를 만들어 발행(+옵션으로 로컬 창 표시)
 
 ---
@@ -271,7 +287,7 @@ PHASE2_FOLLOW
 - **`enable_cmd_vel=False`가 기본값** → 실수로 로봇이 움직이는 것 방지 (dry-run 로그만, Nav2 목표도 실제 전송 대신 로그만, explore resume도 항상 False로 강제)
 - **`enable_autonomous_exploration=False`가 기본값** → 웹캠 타겟이 없어도 로봇이 알아서 돌아다니지 않음
 - 모든 센서(웹캠/뎁스/라이다)에 **stale timeout** 체크 → 오래된 데이터로 잘못된 제어 방지
-- PHASE2에서 라이다 기반 전방 장애물 감지 시 **전진만 차단** (후진/회전은 허용); PHASE1은 Nav2 costmap이 장애물 회피 담당
+- PHASE2에서 라이다 기반 전방 장애물 감지 시, 먼저 `lidar_avoid_trigger_distance`(0.9m) 안에서 좌/우 여유가 있는 쪽으로 **조향 회피**를 시도하고, `lidar_safety_stop_distance`(0.6m)보다 가까워지면 **전진만 차단**(후진/회전은 허용); PHASE1은 Nav2 costmap이 장애물 회피 담당
 - 종료 시 정지 명령 3회 발행
 - 뎁스 핸드오프 거리 체크(`own_cam_handoff_max_depth_m`)로 너무 먼 오탐지에 의한 조기 전환 방지
 - PHASE2로 핸드오프되는 순간 진행 중이던 Nav2 목표는 즉시 취소됨
