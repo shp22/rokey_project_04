@@ -16,6 +16,7 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 | `SUB_MODE_IDLE` | PHASE1 하위 모드: 웹캠 타겟도 없고 자동 탐색도 꺼져있어 대기 중 |
 | `SUB_MODE_EXPLORING` | PHASE1 하위 모드: 웹캠 타겟이 없어 `explore_lite`에 탐색을 맡긴 상태 |
 | `SUB_MODE_NAVIGATING` | PHASE1 하위 모드: 웹캠 타겟이 있어 Nav2에 그 좌표로 목표를 보낸 상태 |
+| `SUB_MODE_UNDOCKING` | PHASE1 하위 모드: 웹캠 타겟은 있는데 아직 도킹된 상태라 먼저 언도킹 중 (완료되어야 Nav2 목표 전송으로 넘어감) |
 | `clamp(value, lo, hi)` | 값을 `[lo, hi]` 범위로 제한 (속도/각속도 제한에 반복 사용) |
 | `normalize_angle(angle)` | 각도를 `(-π, π]` 범위로 정규화 (bearing 계산 시 사용) |
 
@@ -50,7 +51,7 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 
 | 파라미터명 | 기본값 | 설명 |
 |---|---|---|
-| `target_distance` | `0.5` (m) | PHASE2에서 유지하려는 목표 거리 |
+| `target_distance` | `0.6` (m) | PHASE2에서 유지하려는 목표 거리 |
 | `distance_deadband` | `0.03` (m) | 이 오차 범위 내에서는 전진/후진 안 함 |
 | `depth_scale` | `0.001` | 뎁스 raw 값(보통 mm) → 미터 변환 배율 |
 | `depth_patch_size` | `5` | 뎁스 샘플링 시 중심점 주변 패치 크기(픽셀) |
@@ -84,10 +85,18 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 |---|---|---|
 | `nav2_action_name` | `/robot5/navigate_to_pose` | Nav2 `NavigateToPose` 액션 서버 이름 |
 | `nav2_goal_frame_id` | `odom` | 목표 좌표(`PoseStamped.header.frame_id`)의 기준 프레임 (웹캠 타겟 좌표계와 일치해야 함) |
-| `nav2_goal_update_threshold_m` | `0.3` | 새 웹캠 타겟이 기존 목표에서 이 거리 이상 움직였을 때만 새 Nav2 목표 재전송 (너무 잦은 리플랜 방지) |
+| `nav2_goal_update_threshold_m` | `0.5` | 새 웹캠 타겟이 기존 목표에서 이 거리 이상 움직였을 때만 새 Nav2 목표 재전송 (너무 잦으면 이전 goal이 실행 중간에 계속 preempt당해 ABORTED가 반복됨) |
 | `enable_autonomous_exploration` | `False` | 웹캠 타겟이 없을 때 `explore_lite`에 탐색을 맡길지 여부 (**SAFE DEFAULT**) |
 | `explore_resume_topic` | `/robot5/explore/resume` | `explore_lite`에 탐색 재개/일시정지를 알리는 `std_msgs/Bool` 토픽 |
 | `handoff_event_topic` | `/rc_car_chase/handoff_event` | PHASE1→PHASE2 전환 순간 RViz에 표시할 `visualization_msgs/Marker`를 발행하는 토픽 |
+
+### 2-7-1. 자동 언도킹
+
+| 파라미터명 | 기본값 | 설명 |
+|---|---|---|
+| `auto_undock` | `True` | 웹캠이 타겟을 잡았는데 로봇이 아직 도킹 상태면 자동으로 `undock` 액션을 보낼지 |
+| `dock_status_topic` | `/robot5/dock_status` | 도킹 상태(`irobot_create_msgs/msg/DockStatus`) 구독 토픽 |
+| `undock_action_name` | `/robot5/undock` | `irobot_create_msgs/action/Undock` 액션 서버 이름 |
 
 ### 2-8. PHASE2 제어 게인
 
@@ -142,6 +151,8 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 | `self._nav2_last_goal_xy` | `_maybe_send_nav2_goal`/`_send_nav2_goal` | 마지막으로 보낸 목표 좌표 (재전송 threshold 판단용) |
 | `self._phase1_sub_mode` | `_enter_phase1_sub_mode` | PHASE1의 현재 하위 모드 (IDLE/EXPLORING/NAVIGATING_TO_TARGET), 바뀔 때만 로그 |
 | `self._explore_resume_published` | `_set_explore_resume` | 마지막으로 발행한 explore resume 값 (중복 발행 방지) |
+| `self.latest_is_docked`, `self.latest_dock_stamp` | `on_dock_status` | 최신 도킹 상태(`irobot_create_msgs/msg/DockStatus.is_docked`)와 수신 시각 |
+| `self._undock_goal_pending` | 언도킹 콜백들 | 언도킹 goal의 accept/reject·결과 응답을 기다리는 중인지 여부 (중복 전송 방지) |
 
 ---
 
@@ -151,7 +162,7 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 
 | 함수 | 기능 |
 |---|---|
-| `__init__` | 파라미터 로드 → YOLO 모델/CvBridge 준비 → 상태 변수 초기화 → QoS 2종 설정(reliable/depth) → 콜백그룹 5개 생성(webcam/lidar/vision/nav2/timer, 병렬 처리 분리) → 구독 2개(webcam target, lidar) + RGB/뎁스 동기화 구독 → 퍼블리셔(cmd_vel, debug image, explore resume) + Nav2 `NavigateToPose` 액션 클라이언트 → 제어 타이머 생성 |
+| `__init__` | 파라미터 로드 → YOLO 모델/CvBridge 준비 → 상태 변수 초기화 → QoS 2종 설정(reliable/depth) → 콜백그룹 5개 생성(webcam·dock/lidar/vision/nav2·undock/timer, 병렬 처리 분리) → 구독 3개(webcam target, lidar, dock status) + RGB/뎁스 동기화 구독 → 퍼블리셔(cmd_vel, debug image, explore resume, handoff event) + Nav2 `NavigateToPose` / `Undock` 액션 클라이언트 → 제어 타이머 생성 |
 | `_declare_parameters` | 위 표의 모든 파라미터를 기본값과 함께 선언 |
 | `_read_parameters` | 선언된 파라미터 값을 읽어 `self.*` 멤버 변수로 캐싱 (매 루프마다 파라미터 서버 조회하지 않도록) |
 
@@ -160,6 +171,7 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 | 함수 | 콜백 그룹 | 기능 |
 |---|---|---|
 | `on_webcam_target(msg)` | cb_light | 웹캠 타겟 좌표 캐싱 |
+| `on_dock_status(msg)` | cb_light | 도킹 상태(`is_docked`)와 수신 시각 캐싱 |
 | `on_lidar(msg)` | cb_lidar | 스캔 전체 중 **정면 반각(`lidar_front_half_angle`) 범위 + 유효 거리(finite, >0.01m)**만 걸러서 최소값 저장. `lidar_forward_offset_rad`로 정면 기준 보정 |
 | `on_oakd_synced(rgb_msg, depth_msg)` | cb_vision (message_filters 동기화 콜백) | 아래 "5. `on_oakd_synced` 상세" 참고 |
 
@@ -168,7 +180,7 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 | 함수 | 기능 |
 |---|---|
 | `on_control_timer` | 매 `1/control_rate_hz` 초마다 실행. `PHASE1_APPROACH`면 `tick_phase1`만 호출하고 리턴(Nav2가 주행을 대신하므로 여기서 twist 발행 안 함); 그 외(PHASE2)는 `tick_phase2`로 twist를 만들고 `_apply_lidar_safety` 적용 → `enable_cmd_vel=True`면 실제 발행, 아니면 `[DRY RUN]` 로그만 출력 |
-| `tick_phase1(now)` | **PHASE1 로직**: 핸드오프 조건(아래 참고) 확인 → 만족하면 `_publish_handoff_event()`로 RViz 이벤트 마커 발행 후 진행 중인 Nav2 목표 취소하고 PHASE2로 전환 후 리턴. 아니면 웹캠 타겟 신선도로 분기: 신선하면 `NAVIGATING_TO_TARGET` 하위모드로 들어가 explore resume을 끄고 그 좌표로 Nav2 목표 전송(`_maybe_send_nav2_goal`); 신선하지 않고 `enable_autonomous_exploration=True`면 `EXPLORING`로 들어가 Nav2 목표 취소 + explore resume 켬; 둘 다 아니면 `IDLE`로 들어가 Nav2 목표 취소 + explore resume 끔 |
+| `tick_phase1(now)` | **PHASE1 로직**: 핸드오프 조건(아래 참고) 확인 → 만족하면 `_publish_handoff_event()`로 RViz 이벤트 마커 발행 후 진행 중인 Nav2 목표 취소하고 PHASE2로 전환 후 리턴. 아니면 웹캠 타겟 신선도로 분기: 신선하고 `auto_undock=True`이며 아직 도킹 상태면 `UNDOCKING` 하위모드로 들어가 언도킹 goal 전송(`_maybe_send_undock_goal`); 신선하고 (언도킹 불필요하면) `NAVIGATING_TO_TARGET` 하위모드로 들어가 explore resume을 끄고 그 좌표로 Nav2 목표 전송(`_maybe_send_nav2_goal`); 신선하지 않고 `enable_autonomous_exploration=True`면 `EXPLORING`로 들어가 Nav2 목표 취소 + explore resume 켬; 둘 다 아니면 `IDLE`로 들어가 Nav2 목표 취소 + explore resume 끔 |
 | `tick_phase2(now)` | **PHASE2 로직**: 최근 탐지가 없으면 `_search_twist` 호출 → 있으면 바운딩박스 중심의 bearing angle로 각속도 계산, 뎁스로 거리 오차 계산해 전진/후진(데드밴드, 후진 허용 여부 반영) |
 | `_search_twist(now)` | 타겟을 놓쳤을 때: 처음 놓친 시각 기록 → `search_timeout_sec` 초과 시 정지+에러로그 → 아니면 `last_known_bearing_sign` 방향으로 제자리 회전 |
 | `_sample_depth_at_bbox_center(now)` | 현재 바운딩박스 중심 픽셀에서 뎁스 패치 샘플링 (`vision_utils.sample_depth_patch` 호출). 뎁스가 stale하거나 없으면 `None` |
@@ -182,10 +194,13 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 | `_enter_phase1_sub_mode(name)` | PHASE1 하위 모드가 바뀔 때만 `self._phase1_sub_mode` 갱신 + 로그 (매 틱마다 로그 스팸 방지) |
 | `_set_explore_resume(want_resume)` | `explore_resume_topic`에 `Bool` 발행. `enable_cmd_vel=False`(dry-run)면 항상 `False`로 강제 (explore_lite가 실수로 실제 주행하는 것 방지). 이전과 값이 같으면 재발행 안 함 |
 | `_maybe_send_nav2_goal(x, y)` | 아직 이전 목표의 accept/reject 응답 대기 중이면 스킵. 마지막으로 보낸 목표에서 `nav2_goal_update_threshold_m`만큼 안 움직였으면 스킵(리플랜 최소화). `enable_cmd_vel=False`면 실제 전송 없이 `[DRY RUN]` 로그만. 그 외엔 `_send_nav2_goal` 호출 |
-| `_send_nav2_goal(x, y)` | 액션 서버 준비 안 됐으면 경고 후 스킵. `nav2_goal_frame_id` 기준 `PoseStamped`(orientation은 항상 정면 `w=1.0`)를 만들어 `NavigateToPose.Goal`로 비동기 전송, 응답 콜백(`_on_nav2_goal_response`) 등록 |
+| `_send_nav2_goal(x, y)` | 액션 서버 준비 안 됐으면 경고 후 스킵. **진행 중인 이전 goal이 있으면 새로 보내기 전에 먼저 취소**(Nav2의 암묵적 preempt에 기대지 않고 우리 쪽 goal handle 상태를 명확하게 유지). `nav2_goal_frame_id` 기준 `PoseStamped`(orientation은 항상 정면 `w=1.0`)를 만들어 `NavigateToPose.Goal`로 비동기 전송, 응답 콜백(`_on_nav2_goal_response`) 등록 |
 | `_on_nav2_goal_response(future)` | 전송 실패/거부 시 로그만 남기고 종료. 수락되면 `goal_handle` 저장하고 결과 콜백(`_on_nav2_result`) 등록 |
 | `_on_nav2_result(future)` | 목표 완료 시 상태(`SUCCEEDED`/`CANCELED`/`ABORTED`/기타)를 로그로 출력 |
 | `_cancel_nav2_goal_if_active()` | 진행 중인 Nav2 목표가 있으면 비동기 취소 요청 후 goal handle/pending/last-goal 상태를 모두 초기화 |
+| `_maybe_send_undock_goal()` | 이전 언도킹 goal 응답/결과를 기다리는 중이면 스킵. `enable_cmd_vel=False`면 `[DRY RUN]` 로그만. 액션 서버 준비 안 됐으면 경고. 그 외엔 `Undock.Goal()`을 비동기 전송(`_on_undock_goal_response` 등록) — day3_pkg의 `TurtleBot4Navigator.undock()`과 같은 액션을 쓰지만, 그건 내부적으로 `rclpy.spin_until_future_complete`로 **블로킹**하는 방식이라 이 노드의 비동기 타이머/콜백 구조에 안 맞아 raw `ActionClient` + 콜백으로 직접 구현함 |
+| `_on_undock_goal_response(future)` | 전송 실패/거부 시 로그 남기고 `_undock_goal_pending` 해제. 수락되면 결과 콜백(`_on_undock_result`) 등록 |
+| `_on_undock_result(future)` | `_undock_goal_pending` 해제 + 완료 로그. 언도킹이 실제로 끝났는지는 다음 틱의 `on_dock_status`가 갱신한 `latest_is_docked`로 반영됨 |
 
 ### 종료/진입점
 
@@ -216,7 +231,8 @@ RC카 추적의 **메인 컨트롤러**. PHASE1에서는 웹캠이 알려준 타
 ```
 PHASE1_APPROACH
   ├─ 하위 모드 (매 틱 재평가):
-  │    ├─ 웹캠 타겟 fresh          → NAVIGATING_TO_TARGET: Nav2에 (x,y) 목표 전송, explore resume=False
+  │    ├─ 웹캠 타겟 fresh + 아직 도킹 상태(auto_undock=True) → UNDOCKING: 언도킹 goal 전송, explore resume=False
+  │    ├─ 웹캠 타겟 fresh (언도킹 불필요)  → NAVIGATING_TO_TARGET: Nav2에 (x,y) 목표 전송, explore resume=False
   │    ├─ 타겟 stale + explore=on  → EXPLORING: Nav2 목표 취소, explore resume=True
   │    └─ 타겟 stale + explore=off → IDLE: Nav2 목표 취소, explore resume=False
   │

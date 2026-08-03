@@ -11,6 +11,8 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import PointStamped, Twist
+from irobot_create_msgs.action import Undock
+from irobot_create_msgs.msg import DockStatus
 from nav2_msgs.action import NavigateToPose
 from sensor_msgs.msg import CompressedImage, Image, LaserScan
 from std_msgs.msg import Bool
@@ -26,6 +28,7 @@ PHASE2_FOLLOW = 'PHASE2_FOLLOW'
 SUB_MODE_IDLE = 'IDLE'
 SUB_MODE_EXPLORING = 'EXPLORING'
 SUB_MODE_NAVIGATING = 'NAVIGATING_TO_TARGET'
+SUB_MODE_UNDOCKING = 'UNDOCKING'
 
 
 def clamp(value, lo, hi):
@@ -68,6 +71,8 @@ class ChaseControllerNode(Node):
         self.search_start_time = None
         self._depth_debug_printed = False
         self.frame_count = 0
+        self.latest_is_docked = None
+        self.latest_dock_stamp = None
 
         # ---- Nav2 / explore_lite state ----
         self._nav2_goal_handle = None
@@ -75,6 +80,7 @@ class ChaseControllerNode(Node):
         self._nav2_last_goal_xy = None
         self._phase1_sub_mode = None
         self._explore_resume_published = None
+        self._undock_goal_pending = False
 
         reliable_qos = QoSProfile(depth=1)
         reliable_qos.reliability = ReliabilityPolicy.RELIABLE
@@ -100,6 +106,10 @@ class ChaseControllerNode(Node):
             LaserScan, self.lidar_topic, self.on_lidar, reliable_qos,
             callback_group=cb_lidar,
         )
+        self.create_subscription(
+            DockStatus, self.dock_status_topic, self.on_dock_status, reliable_qos,
+            callback_group=cb_light,
+        )
 
         rgb_sub = message_filters.Subscriber(
             self, CompressedImage, self.own_cam_rgb_topic, qos_profile=reliable_qos, callback_group=cb_vision,
@@ -120,6 +130,9 @@ class ChaseControllerNode(Node):
         self.handoff_event_pub = self.create_publisher(Marker, self.handoff_event_topic, 1)
         self.nav2_action_client = ActionClient(
             self, NavigateToPose, self.nav2_action_name, callback_group=cb_nav2,
+        )
+        self.undock_action_client = ActionClient(
+            self, Undock, self.undock_action_name, callback_group=cb_nav2,
         )
 
         self.timer = self.create_timer(1.0 / self.control_rate_hz, self.on_control_timer, callback_group=cb_timer)
@@ -145,7 +158,7 @@ class ChaseControllerNode(Node):
             'own_cam_handoff_max_depth_m': 0.7,
             'tracker': 'bytetrack.yaml',
             'target_class_id': 0,
-            'target_distance': 0.5,
+            'target_distance': 0.6,
             'distance_deadband': 0.03,
             'depth_scale': 0.001,
             'depth_patch_size': 5,
@@ -178,9 +191,12 @@ class ChaseControllerNode(Node):
             'nav2_action_name': '/robot5/navigate_to_pose',
             'explore_resume_topic': '/robot5/explore/resume',
             'handoff_event_topic': '/rc_car_chase/handoff_event',
-            'nav2_goal_update_threshold_m': 0.3,
+            'nav2_goal_update_threshold_m': 0.5,
             'nav2_goal_frame_id': 'odom',
             'enable_autonomous_exploration': False,
+            'dock_status_topic': '/robot5/dock_status',
+            'undock_action_name': '/robot5/undock',
+            'auto_undock': True,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -234,12 +250,19 @@ class ChaseControllerNode(Node):
         self.nav2_goal_update_threshold_m = g('nav2_goal_update_threshold_m')
         self.nav2_goal_frame_id = g('nav2_goal_frame_id')
         self.enable_autonomous_exploration = g('enable_autonomous_exploration')
+        self.dock_status_topic = g('dock_status_topic')
+        self.undock_action_name = g('undock_action_name')
+        self.auto_undock = g('auto_undock')
 
     # --------------------------------------------------------------- callbacks
 
     def on_webcam_target(self, msg: PointStamped):
         self.latest_webcam_target = msg.point
         self.latest_webcam_stamp = self.get_clock().now()
+
+    def on_dock_status(self, msg: DockStatus):
+        self.latest_is_docked = msg.is_docked
+        self.latest_dock_stamp = self.get_clock().now()
 
     def on_lidar(self, msg: LaserScan):
         front = []
@@ -346,7 +369,11 @@ class ChaseControllerNode(Node):
             and (now - self.latest_webcam_stamp) <= Duration(seconds=self.webcam_stale_timeout)
         )
 
-        if webcam_fresh:
+        if webcam_fresh and self.auto_undock and self.latest_is_docked:
+            self._enter_phase1_sub_mode(SUB_MODE_UNDOCKING)
+            self._set_explore_resume(False)
+            self._maybe_send_undock_goal()
+        elif webcam_fresh:
             self._enter_phase1_sub_mode(SUB_MODE_NAVIGATING)
             self._set_explore_resume(False)
             self._maybe_send_nav2_goal(self.latest_webcam_target.x, self.latest_webcam_target.y)
@@ -497,6 +524,13 @@ class ChaseControllerNode(Node):
             self.get_logger().warn('nav2 action server not ready yet, skipping goal', throttle_duration_sec=2.0)
             return
 
+        if self._nav2_goal_handle is not None:
+            # cancel the in-flight goal ourselves rather than relying on Nav2's implicit
+            # preemption - keeps our own goal-handle bookkeeping unambiguous and avoids a
+            # stray result callback for the superseded goal.
+            self._nav2_goal_handle.cancel_goal_async()
+            self._nav2_goal_handle = None
+
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose.header.frame_id = self.nav2_goal_frame_id
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
@@ -546,12 +580,57 @@ class ChaseControllerNode(Node):
         self._nav2_goal_pending = False
         self._nav2_last_goal_xy = None
 
+    def _maybe_send_undock_goal(self):
+        if self._undock_goal_pending:
+            return  # still waiting on accept/reject or result for a previous send
+
+        if not self.enable_cmd_vel:
+            self.get_logger().info(
+                '[DRY RUN] would send undock goal (car detected while docked)', throttle_duration_sec=2.0,
+            )
+            return
+
+        if not self.undock_action_client.server_is_ready():
+            self.get_logger().warn('undock action server not ready yet', throttle_duration_sec=2.0)
+            return
+
+        self._undock_goal_pending = True
+        self.get_logger().info('AUTO-UNDOCK: car detected while docked - undocking')
+        send_future = self.undock_action_client.send_goal_async(Undock.Goal())
+        send_future.add_done_callback(self._on_undock_goal_response)
+
+    def _on_undock_goal_response(self, future):
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self.get_logger().error(f'undock send_goal_async failed: {exc}')
+            self._undock_goal_pending = False
+            return
+        if not goal_handle.accepted:
+            self.get_logger().warn('AUTO-UNDOCK: goal rejected')
+            self._undock_goal_pending = False
+            return
+        goal_handle.get_result_async().add_done_callback(self._on_undock_result)
+
+    def _on_undock_result(self, future):
+        self._undock_goal_pending = False
+        try:
+            future.result()
+        except Exception as exc:
+            self.get_logger().error(f'undock get_result_async failed: {exc}')
+            return
+        self.get_logger().info('AUTO-UNDOCK: finished')
+
     # ------------------------------------------------------------------ misc
 
     def destroy_node(self):
-        stop = Twist()
-        for _ in range(3):
-            self.cmd_pub.publish(stop)
+        if rclpy.ok():
+            stop = Twist()
+            for _ in range(3):
+                try:
+                    self.cmd_pub.publish(stop)
+                except rclpy._rclpy_pybind11.RCLError:
+                    break  # context already torn down (e.g. Ctrl+C) - nothing more we can do
         if self.show_window:
             cv2.destroyAllWindows()
         super().destroy_node()

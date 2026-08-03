@@ -45,9 +45,13 @@ def generate_launch_description():
         DeclareLaunchArgument('bringup_nav2_stack', default_value='true'),
         DeclareLaunchArgument('nav2_action_name', default_value='/robot5/navigate_to_pose'),
         DeclareLaunchArgument('explore_resume_topic', default_value='/robot5/explore/resume'),
-        DeclareLaunchArgument('nav2_goal_update_threshold_m', default_value='0.3'),
+        DeclareLaunchArgument('nav2_goal_update_threshold_m', default_value='0.5'),
         DeclareLaunchArgument('nav2_goal_frame_id', default_value='odom'),
         DeclareLaunchArgument('enable_autonomous_exploration', default_value='false'),  # SAFE DEFAULT
+        # Auto-undock: undock automatically once the webcam detects the car while docked
+        DeclareLaunchArgument('auto_undock', default_value='true'),
+        DeclareLaunchArgument('dock_status_topic', default_value='/robot5/dock_status'),
+        DeclareLaunchArgument('undock_action_name', default_value='/robot5/undock'),
     ]
 
     nav2_stack = IncludeLaunchDescription(
@@ -88,6 +92,9 @@ def generate_launch_description():
             'nav2_goal_update_threshold_m': LaunchConfiguration('nav2_goal_update_threshold_m'),
             'nav2_goal_frame_id': LaunchConfiguration('nav2_goal_frame_id'),
             'enable_autonomous_exploration': LaunchConfiguration('enable_autonomous_exploration'),
+            'auto_undock': LaunchConfiguration('auto_undock'),
+            'dock_status_topic': LaunchConfiguration('dock_status_topic'),
+            'undock_action_name': LaunchConfiguration('undock_action_name'),
         }],
     )
 

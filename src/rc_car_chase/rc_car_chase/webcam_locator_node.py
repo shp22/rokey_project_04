@@ -1,3 +1,5 @@
+from collections import deque
+
 import cv2
 import rclpy
 from rclpy.node import Node
@@ -28,6 +30,8 @@ class WebcamLocatorNode(Node):
         self.declare_parameter('overlay_topic', '/rc_car_chase/webcam_debug_image')
         self.declare_parameter('publish_overlay', True)
         self.declare_parameter('show_window', True)
+        self.declare_parameter('confirm_window_size', 8)
+        self.declare_parameter('confirm_min_hits', 6)
 
         device = self.get_parameter('device').value
         capture_width = self.get_parameter('capture_width').value
@@ -42,6 +46,8 @@ class WebcamLocatorNode(Node):
         overlay_topic = self.get_parameter('overlay_topic').value
         self.publish_overlay = self.get_parameter('publish_overlay').value
         self.show_window = self.get_parameter('show_window').value
+        self.confirm_min_hits = self.get_parameter('confirm_min_hits').value
+        confirm_window_size = self.get_parameter('confirm_window_size').value
 
         try:
             self.homography = load_homography_yaml(homography_yaml_path)
@@ -70,6 +76,7 @@ class WebcamLocatorNode(Node):
 
         self.locked_track_id = None
         self.frame_count = 0
+        self.detection_hits = deque(maxlen=confirm_window_size)
 
         self.timer = self.create_timer(1.0 / capture_fps, self.on_timer)
 
@@ -95,20 +102,24 @@ class WebcamLocatorNode(Node):
         boxes = results[0].boxes
         target = select_target_box(boxes, self.target_class_id, self.locked_track_id)
 
+        self.detection_hits.append(target is not None)
+        confirmed = sum(self.detection_hits) >= self.confirm_min_hits
+
         if target is not None:
             self.locked_track_id = int(target.id[0]) if target.id is not None else self.locked_track_id
-            x1, y1, x2, y2 = target.xyxy[0].tolist()
-            u = (x1 + x2) / 2.0
-            v = y2  # bbox bottom = car's ground contact point
-            x, y = apply_homography(u, v, self.homography)
+            if confirmed:
+                x1, y1, x2, y2 = target.xyxy[0].tolist()
+                u = (x1 + x2) / 2.0
+                v = y2  # bbox bottom = car's ground contact point
+                x, y = apply_homography(u, v, self.homography)
 
-            msg = PointStamped()
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.header.frame_id = 'odom'
-            msg.point.x = x
-            msg.point.y = y
-            msg.point.z = 0.0
-            self.target_pub.publish(msg)
+                msg = PointStamped()
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.header.frame_id = 'odom'
+                msg.point.x = x
+                msg.point.y = y
+                msg.point.z = 0.0
+                self.target_pub.publish(msg)
         else:
             self.locked_track_id = None
 

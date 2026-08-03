@@ -31,9 +31,12 @@ launch 인자(`DeclareLaunchArgument`)로 노출해서 커맨드라인에서 바
 | `rviz_config` | `.../config/rc_car_chase.rviz` | `rviz2` → `-d` | 맵/라이다/자체카메라 디버그 이미지/핸드오프 이벤트 마커가 미리 구성된 RViz 설정 파일 |
 | `nav2_action_name` | `/robot5/navigate_to_pose` | chase_controller_node | Nav2 `NavigateToPose` 액션 서버 이름 |
 | `explore_resume_topic` | `/robot5/explore/resume` | chase_controller_node | `explore_lite` 재개/일시정지 제어 토픽 |
-| `nav2_goal_update_threshold_m` | `0.3` | chase_controller_node | 이 거리 이상 타겟이 움직여야 Nav2 목표 재전송 |
+| `nav2_goal_update_threshold_m` | `0.5` | chase_controller_node | 이 거리 이상 타겟이 움직여야 Nav2 목표 재전송 (너무 잦으면 이전 goal이 끝나기도 전에 계속 preempt되어 ABORTED가 반복됨) |
 | `nav2_goal_frame_id` | `odom` | chase_controller_node | Nav2 목표 좌표 기준 프레임 |
 | `enable_autonomous_exploration` | `false` | chase_controller_node | **SAFE DEFAULT.** 웹캠 타겟이 없을 때 `explore_lite`로 자동 탐색할지 |
+| `auto_undock` | `true` | chase_controller_node | 웹캠이 타겟을 잡았는데 아직 도킹 상태면 자동으로 `undock` 액션부터 보낼지 |
+| `dock_status_topic` | `/robot5/dock_status` | chase_controller_node | 도킹 상태 구독 토픽 |
+| `undock_action_name` | `/robot5/undock` | chase_controller_node | `Undock` 액션 서버 이름 |
 
 > 위 표에 없는 나머지 파라미터(예: `fx`, `cx`, `depth_scale` 등)는 launch 인자로
 > 노출되어 있지 않음 → 필요하면 `chase_controller_node.py`의 `_declare_parameters` 기본값을
