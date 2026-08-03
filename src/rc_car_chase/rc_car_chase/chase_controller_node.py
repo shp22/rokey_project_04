@@ -69,6 +69,15 @@ class ChaseControllerNode(Node):
         self.search_start_time = None
         self.last_known_heading_sign = 1
         self.phase1_search_start_time = None
+        self.latest_bearing_angle = None
+        self.prev_bearing_angle = None
+        self.prev_bearing_time = None
+        self.bearing_rate_est = 0.0
+        self.latest_odom_yaw_rate = 0.0
+        self.latest_odom_lin_vel = 0.0
+        self.prev_range_m = None
+        self.prev_range_time = None
+        self.range_rate_est = 0.0
         self._depth_debug_printed = False
         self.frame_count = 0
 
@@ -157,6 +166,9 @@ class ChaseControllerNode(Node):
             'phase2_max_lin': 0.15,
             'phase2_max_lin_reverse': 0.08,
             'allow_reverse': True,
+            'phase2_ff_gain_ang': 0.0,
+            'phase2_ff_gain_lin': 0.0,
+            'ff_smoothing_alpha': 0.3,
             'search_ang_speed': 0.3,
             'search_timeout_sec': 15.0,
             'control_rate_hz': 10.0,
@@ -212,6 +224,9 @@ class ChaseControllerNode(Node):
         self.phase2_max_lin = g('phase2_max_lin')
         self.phase2_max_lin_reverse = g('phase2_max_lin_reverse')
         self.allow_reverse = g('allow_reverse')
+        self.phase2_ff_gain_ang = g('phase2_ff_gain_ang')
+        self.phase2_ff_gain_lin = g('phase2_ff_gain_lin')
+        self.ff_smoothing_alpha = g('ff_smoothing_alpha')
         self.search_ang_speed = g('search_ang_speed')
         self.search_timeout_sec = g('search_timeout_sec')
         self.control_rate_hz = g('control_rate_hz')
@@ -236,9 +251,16 @@ class ChaseControllerNode(Node):
 
     def on_odom(self, msg: Odometry):
         p = msg.pose.pose.position
+        new_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
+        now = self.get_clock().now()
+        if self.latest_odom_stamp is not None:
+            dt = (now - self.latest_odom_stamp).nanoseconds * 1e-9
+            if dt > 1e-3:
+                self.latest_odom_yaw_rate = normalize_angle(new_yaw - self.latest_odom_yaw) / dt
         self.latest_odom_xy = (p.x, p.y)
-        self.latest_odom_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
-        self.latest_odom_stamp = self.get_clock().now()
+        self.latest_odom_yaw = new_yaw
+        self.latest_odom_stamp = now
+        self.latest_odom_lin_vel = msg.twist.twist.linear.x
 
     def on_lidar(self, msg: LaserScan):
         front = []
@@ -301,9 +323,14 @@ class ChaseControllerNode(Node):
                 self.own_cam_confirm_count = min(self.own_cam_confirm_count + 1, self.own_cam_confirm_frames)
             else:
                 self.own_cam_confirm_count = 0
+
+            self.latest_bearing_angle = math.atan2(u_center - self.cx, self.fx)
+            self._update_bearing_rate_estimate(now)
+            self._update_range_rate_estimate(self._sample_depth_at_bbox_center(now), now)
         else:
             self.locked_track_id = None
             self.own_cam_confirm_count = 0
+            self._reset_feedforward_state()
 
         if self.publish_debug_image:
             overlay = results[0].plot()
@@ -398,24 +425,24 @@ class ChaseControllerNode(Node):
             return self._search_twist(now)
 
         self.search_start_time = None
-        x1, _, x2, _ = self.latest_own_cam_bbox
-        u_center = (x1 + x2) / 2.0
-        bearing_angle = math.atan2(u_center - self.cx, self.fx)
+        bearing_angle = self.latest_bearing_angle
 
         twist = Twist()
-        twist.angular.z = clamp(-self.phase2_kp_ang * bearing_angle, -self.phase2_max_ang, self.phase2_max_ang)
+        ang_cmd = -self.phase2_kp_ang * bearing_angle + self.phase2_ff_gain_ang * self.bearing_rate_est
+        twist.angular.z = clamp(ang_cmd, -self.phase2_max_ang, self.phase2_max_ang)
 
         z = self._sample_depth_at_bbox_center(now)
         if z is None:
             twist.linear.x = 0.0
         else:
             err = z - self.target_distance
+            ff_lin = self.phase2_ff_gain_lin * self.range_rate_est
             if abs(err) < self.distance_deadband:
                 twist.linear.x = 0.0
             elif err > 0:
-                twist.linear.x = clamp(self.phase2_kp_lin * err, 0.0, self.phase2_max_lin)
+                twist.linear.x = clamp(self.phase2_kp_lin * err + ff_lin, 0.0, self.phase2_max_lin)
             elif self.allow_reverse:
-                twist.linear.x = clamp(self.phase2_kp_lin * err, -self.phase2_max_lin_reverse, 0.0)
+                twist.linear.x = clamp(self.phase2_kp_lin * err + ff_lin, -self.phase2_max_lin_reverse, 0.0)
             else:
                 twist.linear.x = 0.0
         return twist
@@ -452,6 +479,38 @@ class ChaseControllerNode(Node):
             and self.latest_webcam_stamp is not None
             and (now - self.latest_webcam_stamp) <= Duration(seconds=self.webcam_stale_timeout)
         )
+
+    def _update_bearing_rate_estimate(self, now):
+        if self.prev_bearing_time is not None:
+            dt = (now - self.prev_bearing_time).nanoseconds * 1e-9
+            if dt > 1e-3:
+                raw_rate = (
+                    normalize_angle(self.latest_bearing_angle - self.prev_bearing_angle) / dt
+                    + self.latest_odom_yaw_rate
+                )
+                a = self.ff_smoothing_alpha
+                self.bearing_rate_est = a * raw_rate + (1.0 - a) * self.bearing_rate_est
+        self.prev_bearing_angle = self.latest_bearing_angle
+        self.prev_bearing_time = now
+
+    def _update_range_rate_estimate(self, range_m, now):
+        if range_m is not None and self.prev_range_time is not None:
+            dt = (now - self.prev_range_time).nanoseconds * 1e-9
+            if dt > 1e-3:
+                raw_rate = (range_m - self.prev_range_m) / dt + self.latest_odom_lin_vel
+                a = self.ff_smoothing_alpha
+                self.range_rate_est = a * raw_rate + (1.0 - a) * self.range_rate_est
+        if range_m is not None:
+            self.prev_range_m = range_m
+            self.prev_range_time = now
+
+    def _reset_feedforward_state(self):
+        self.prev_bearing_angle = None
+        self.prev_bearing_time = None
+        self.bearing_rate_est = 0.0
+        self.prev_range_m = None
+        self.prev_range_time = None
+        self.range_rate_est = 0.0
 
     def _sample_depth_at_bbox_center(self, now=None):
         if self.latest_own_cam_bbox is None or self.latest_depth_image is None:
