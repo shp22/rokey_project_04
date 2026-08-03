@@ -164,7 +164,8 @@ RC카 추적의 **메인 컨트롤러**. 웹캠 타겟 좌표 + 오도메트리�
 | `on_control_timer` | 매 `1/control_rate_hz` 초마다 실행. 현재 state에 따라 `tick_phase1`/`tick_phase2` 호출 → `_apply_lidar_safety` 적용 → `enable_cmd_vel=True`면 실제 발행, 아니면 `[DRY RUN]` 로그만 출력 |
 | `tick_phase1(now)` | **PHASE1 로직**: 핸드오프 조건 확인(아래 참고) → 웹캠/오도메트리 신선도 확인(오래됐으면 정지) → 타겟 방향(`atan2(dy,dx)`)과 로봇 yaw의 차이(heading_error)로 각속도 비례제어, `cos(heading_error)`로 전진속도 스케일(방향이 틀어질수록 감속) |
 | `tick_phase2(now)` | **PHASE2 로직**: 최근 탐지가 없으면 `_search_twist` 호출 → 있으면 바운딩박스 중심의 bearing angle로 각속도 계산, 뎁스로 거리 오차 계산해 전진/후진(데드밴드, 후진 허용 여부 반영) |
-| `_search_twist(now)` | 타겟을 놓쳤을 때: 처음 놓친 시각 기록 → `search_timeout_sec` 초과 시 정지+에러로그 → 아니면 `last_known_bearing_sign` 방향으로 제자리 회전 |
+| `_search_twist(now)` | 타겟을 놓쳤을 때: 처음 놓친 시각 기록 → `search_timeout_sec` 초과 시, 웹캠 타겟이 신선하면(`_webcam_target_fresh`) `PHASE1_APPROACH`로 복귀(핸드오프 상태 리셋), 아니면 정지+에러로그 → 타임아웃 전이면 `last_known_bearing_sign` 방향으로 제자리 회전 |
+| `_webcam_target_fresh(now)` | `latest_webcam_target`이 있고 `webcam_stale_timeout` 이내인지 확인 (PHASE2 탐색 타임아웃 시 웹캠 폴백 가능 여부 판단용) |
 | `_sample_depth_at_bbox_center(now)` | 현재 바운딩박스 중심 픽셀에서 뎁스 패치 샘플링 (`vision_utils.sample_depth_patch` 호출). 뎁스가 stale하거나 없으면 `None` |
 | `_apply_lidar_safety(twist, now)` | 라이다 데이터가 신선하고 전방 최소거리가 안전거리 미만이면 전진 속도를 0 이하로 clamp (후진은 허용). 라이다 데이터가 없거나 오래되면 **안전layer를 건너뜀** (막지 않음) |
 
@@ -203,10 +204,15 @@ PHASE1_APPROACH
 PHASE2_FOLLOW
   └─ detection_loss_timeout 동안 자체 카메라 탐지 없음
        ─────────────────────────────────────────────► 탐색(제자리 회전) 모드
-       (search_timeout_sec 초과 시 완전 정지 후 재탐지 대기, 상태는 PHASE2 유지)
+       └─ search_timeout_sec 초과 시:
+            ├─ 웹캠 타겟이 신선함(_webcam_target_fresh) ──► PHASE1_APPROACH로 복귀 (재접근)
+            └─ 웹캠도 stale                            ──► 완전 정지, 재탐지 대기 (상태는 PHASE2 유지)
 ```
 
-※ PHASE2 → PHASE1로 되돌아가는 로직은 없음 (한 번 핸드오프되면 계속 자체 카메라로만 추적).
+※ PHASE2 → PHASE1 폴백: 자체 카메라로 `search_timeout_sec` 동안 재탐색해도 못 찾았을 때, 고정 웹캠이
+여전히 차를 보고 있으면(`webcam_stale_timeout` 이내) PHASE1로 복귀해 웹캠 유도로 다시 접근한다.
+이때 `own_cam_confirm_count`/`locked_track_id`도 리셋되어, 이후 정상적인 핸드오프 조건을 다시 만족해야
+PHASE2로 재전환된다. 웹캠도 타겟을 놓친 상태라면 기존과 동일하게 완전 정지 후 재탐지를 기다린다.
 
 ---
 

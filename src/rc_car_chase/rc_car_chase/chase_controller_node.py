@@ -386,14 +386,34 @@ class ChaseControllerNode(Node):
         if self.search_start_time is None:
             self.search_start_time = now
             self.get_logger().warn('car lost on own camera - starting rotate-search')
+
         if (now - self.search_start_time) > Duration(seconds=self.search_timeout_sec):
+            if self._webcam_target_fresh(now):
+                self.get_logger().warn(
+                    'own-camera search timed out - car still visible to webcam, '
+                    'falling back to PHASE1_APPROACH'
+                )
+                self.state = PHASE1_APPROACH
+                self.search_start_time = None
+                self.own_cam_confirm_count = 0
+                self.locked_track_id = None
+                return Twist()
             self.get_logger().error(
-                'search timed out - stopping and waiting for re-acquisition', throttle_duration_sec=5.0,
+                'search timed out and no fresh webcam target - stopping and waiting for re-acquisition',
+                throttle_duration_sec=5.0,
             )
             return Twist()
+
         twist = Twist()
         twist.angular.z = self.search_ang_speed * self.last_known_bearing_sign
         return twist
+
+    def _webcam_target_fresh(self, now) -> bool:
+        return (
+            self.latest_webcam_target is not None
+            and self.latest_webcam_stamp is not None
+            and (now - self.latest_webcam_stamp) <= Duration(seconds=self.webcam_stale_timeout)
+        )
 
     def _sample_depth_at_bbox_center(self, now=None):
         if self.latest_own_cam_bbox is None or self.latest_depth_image is None:
