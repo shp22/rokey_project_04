@@ -11,12 +11,12 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
-from geometry_msgs.msg import PointStamped, Twist
+from geometry_msgs.msg import PointStamped
 from irobot_create_msgs.action import Undock
 from irobot_create_msgs.msg import DockStatus
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import CompressedImage, Image, LaserScan
+from sensor_msgs.msg import CompressedImage, Image
 from std_msgs.msg import Bool
 from visualization_msgs.msg import Marker
 from cv_bridge import CvBridge
@@ -31,18 +31,6 @@ SUB_MODE_IDLE = 'IDLE'
 SUB_MODE_EXPLORING = 'EXPLORING'
 SUB_MODE_NAVIGATING = 'NAVIGATING_TO_TARGET'
 SUB_MODE_UNDOCKING = 'UNDOCKING'
-
-
-def clamp(value, lo, hi):
-    return max(lo, min(hi, value))
-
-
-def normalize_angle(angle):
-    while angle > math.pi:
-        angle -= 2.0 * math.pi
-    while angle < -math.pi:
-        angle += 2.0 * math.pi
-    return angle
 
 
 class ChaseControllerNode(Node):
@@ -65,29 +53,13 @@ class ChaseControllerNode(Node):
         self.latest_own_cam_stamp = None
         self.latest_depth_image = None
         self.latest_depth_stamp = None
-        self.latest_lidar_min_front = None
-        self.latest_lidar_min_left = float('inf')
-        self.latest_lidar_min_right = float('inf')
-        self.latest_lidar_stamp = None
         self.own_cam_confirm_count = 0
         self.locked_track_id = None
-        self.last_known_bearing_sign = 1
-        self.search_start_time = None
         self._depth_debug_printed = False
         self.frame_count = 0
         self.latest_is_docked = None
         self.latest_dock_stamp = None
-
-        # ---- PHASE2 feedforward state (bearing/range rate-of-change estimates) ----
-        self.latest_bearing_angle = None
-        self.prev_bearing_angle = None
-        self.prev_bearing_time = None
-        self.bearing_rate_est = 0.0
-        self.prev_range_m = None
-        self.prev_range_time = None
-        self.range_rate_est = 0.0
-        self.latest_odom_yaw_rate = 0.0
-        self.latest_odom_lin_vel = 0.0
+        self.latest_odom_xy = None
 
         # ---- Nav2 / explore_lite state ----
         self._nav2_goal_handle = None
@@ -109,17 +81,12 @@ class ChaseControllerNode(Node):
 
         cb_light = MutuallyExclusiveCallbackGroup()
         cb_vision = MutuallyExclusiveCallbackGroup()
-        cb_lidar = MutuallyExclusiveCallbackGroup()
         cb_nav2 = MutuallyExclusiveCallbackGroup()
         cb_timer = MutuallyExclusiveCallbackGroup()
 
         self.create_subscription(
             PointStamped, self.webcam_target_topic, self.on_webcam_target, reliable_qos,
             callback_group=cb_light,
-        )
-        self.create_subscription(
-            LaserScan, self.lidar_topic, self.on_lidar, reliable_qos,
-            callback_group=cb_lidar,
         )
         self.create_subscription(
             DockStatus, self.dock_status_topic, self.on_dock_status, reliable_qos,
@@ -141,7 +108,6 @@ class ChaseControllerNode(Node):
         )
         self._sync.registerCallback(self.on_oakd_synced)
 
-        self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 1)
         self.debug_pub = (
             self.create_publisher(Image, self.debug_image_topic, 1) if self.publish_debug_image else None
         )
@@ -167,7 +133,6 @@ class ChaseControllerNode(Node):
         defaults = {
             'own_cam_rgb_topic': '/robot5/oakd/rgb/image_raw/compressed',
             'own_cam_depth_topic': '/robot5/oakd/stereo/image_raw/compressedDepth',
-            'cmd_vel_topic': '/robot5/cmd_vel',
             'webcam_target_topic': '/rc_car_chase/webcam_target',
             'own_cam_model_path':
                 '/home/rokey/rokey_ws/runs/detect/runs_train/car_dum_yolo11n_seqsplit/weights/best.pt',
@@ -178,41 +143,19 @@ class ChaseControllerNode(Node):
             'tracker': 'bytetrack.yaml',
             'target_class_id': 0,
             'target_distance': 0.6,
-            'distance_deadband': 0.03,
             'depth_scale': 0.001,
             'depth_patch_size': 5,
             'depth_stale_timeout': 0.5,
-            'detection_loss_timeout': 1.5,
             'webcam_stale_timeout': 1.0,
             'depth_qos_best_effort': False,
             'rgb_depth_sync_slop': 0.1,
-            'fx': 565.6582641601562,
-            'cx': 355.6732177734375,
-            'phase2_kp_ang': 1.0,
-            'phase2_max_ang': 0.6,
-            'phase2_kp_lin': 0.5,
-            'phase2_max_lin': 0.15,
-            'phase2_max_lin_reverse': 0.08,
-            'allow_reverse': True,
-            'phase2_ff_gain_ang': 0.0,
-            'phase2_ff_gain_lin': 0.0,
-            'ff_smoothing_alpha': 0.3,
             'odom_topic': '/robot5/odom',
-            'search_ang_speed': 0.3,
-            'search_timeout_sec': 15.0,
             'control_rate_hz': 10.0,
             'publish_debug_image': True,
             'debug_image_topic': '/rc_car_chase/debug_image',
             'show_window': False,
             'enable_cmd_vel': False,
             'initial_state': PHASE1_APPROACH,
-            'lidar_topic': '/robot5/scan',
-            'lidar_front_half_angle': 0.44,
-            'lidar_safety_stop_distance': 0.6,
-            'lidar_avoid_trigger_distance': 0.9,
-            'lidar_avoid_kp': 1.5,
-            'lidar_stale_timeout': 1.0,
-            'lidar_forward_offset_rad': 0.0,
             'nav2_action_name': '/robot5/navigate_to_pose',
             'explore_resume_topic': '/robot5/explore/resume',
             'handoff_event_topic': '/rc_car_chase/handoff_event',
@@ -230,7 +173,6 @@ class ChaseControllerNode(Node):
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.own_cam_rgb_topic = g('own_cam_rgb_topic')
         self.own_cam_depth_topic = g('own_cam_depth_topic')
-        self.cmd_vel_topic = g('cmd_vel_topic')
         self.webcam_target_topic = g('webcam_target_topic')
         self.own_cam_model_path = g('own_cam_model_path')
         self.own_cam_conf_threshold = g('own_cam_conf_threshold')
@@ -240,41 +182,19 @@ class ChaseControllerNode(Node):
         self.tracker_cfg = g('tracker')
         self.target_class_id = g('target_class_id')
         self.target_distance = g('target_distance')
-        self.distance_deadband = g('distance_deadband')
         self.depth_scale = g('depth_scale')
         self.depth_patch_size = g('depth_patch_size')
         self.depth_stale_timeout = g('depth_stale_timeout')
-        self.detection_loss_timeout = g('detection_loss_timeout')
         self.webcam_stale_timeout = g('webcam_stale_timeout')
         self.depth_qos_best_effort = g('depth_qos_best_effort')
         self.rgb_depth_sync_slop = g('rgb_depth_sync_slop')
-        self.fx = g('fx')
-        self.cx = g('cx')
-        self.phase2_kp_ang = g('phase2_kp_ang')
-        self.phase2_max_ang = g('phase2_max_ang')
-        self.phase2_kp_lin = g('phase2_kp_lin')
-        self.phase2_max_lin = g('phase2_max_lin')
-        self.phase2_max_lin_reverse = g('phase2_max_lin_reverse')
-        self.allow_reverse = g('allow_reverse')
-        self.phase2_ff_gain_ang = g('phase2_ff_gain_ang')
-        self.phase2_ff_gain_lin = g('phase2_ff_gain_lin')
-        self.ff_smoothing_alpha = g('ff_smoothing_alpha')
         self.odom_topic = g('odom_topic')
-        self.search_ang_speed = g('search_ang_speed')
-        self.search_timeout_sec = g('search_timeout_sec')
         self.control_rate_hz = g('control_rate_hz')
         self.publish_debug_image = g('publish_debug_image')
         self.debug_image_topic = g('debug_image_topic')
         self.show_window = g('show_window')
         self.enable_cmd_vel = g('enable_cmd_vel')
         self.initial_state = g('initial_state')
-        self.lidar_topic = g('lidar_topic')
-        self.lidar_front_half_angle = g('lidar_front_half_angle')
-        self.lidar_safety_stop_distance = g('lidar_safety_stop_distance')
-        self.lidar_avoid_trigger_distance = g('lidar_avoid_trigger_distance')
-        self.lidar_avoid_kp = g('lidar_avoid_kp')
-        self.lidar_stale_timeout = g('lidar_stale_timeout')
-        self.lidar_forward_offset_rad = g('lidar_forward_offset_rad')
         self.nav2_action_name = g('nav2_action_name')
         self.explore_resume_topic = g('explore_resume_topic')
         self.handoff_event_topic = g('handoff_event_topic')
@@ -296,29 +216,10 @@ class ChaseControllerNode(Node):
         self.latest_dock_stamp = self.get_clock().now()
 
     def on_odom(self, msg: Odometry):
-        # only used for PHASE2 feedforward ego-motion compensation - read the robot's
-        # own reported twist directly rather than differentiating pose ourselves.
-        self.latest_odom_yaw_rate = msg.twist.twist.angular.z
-        self.latest_odom_lin_vel = msg.twist.twist.linear.x
-
-    def on_lidar(self, msg: LaserScan):
-        front = []
-        left_min = float('inf')
-        right_min = float('inf')
-        angle = msg.angle_min
-        for r in msg.ranges:
-            a = normalize_angle(angle - self.lidar_forward_offset_rad)
-            if abs(a) <= self.lidar_front_half_angle and math.isfinite(r) and r > 0.01:
-                front.append(r)
-                if a >= 0.0:
-                    left_min = min(left_min, r)
-                else:
-                    right_min = min(right_min, r)
-            angle += msg.angle_increment
-        self.latest_lidar_min_front = min(front) if front else float('inf')
-        self.latest_lidar_min_left = left_min
-        self.latest_lidar_min_right = right_min
-        self.latest_lidar_stamp = self.get_clock().now()
+        # only used to know the robot's own position for the PHASE2 standoff-offset
+        # calculation - PHASE1 leaves all positioning to Nav2.
+        p = msg.pose.pose.position
+        self.latest_odom_xy = (p.x, p.y)
 
     def on_oakd_synced(self, rgb_msg: CompressedImage, depth_msg: CompressedImage):
         frame = self.bridge.compressed_imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
@@ -343,6 +244,9 @@ class ChaseControllerNode(Node):
         if self.frame_count % 30 == 1:
             self.get_logger().info(f'own-cam: processed {self.frame_count} synced frames, state={self.state}')
 
+        # Own camera is only used to CONFIRM the car is really close (for the PHASE1 ->
+        # PHASE2 handoff gate) - actual PHASE2 driving is done via the webcam target, same
+        # as PHASE1, just with a standoff offset. See tick_phase2().
         results = self.own_cam_model.track(
             frame, persist=True, conf=self.own_cam_conf_threshold,
             tracker=self.tracker_cfg, verbose=False,
@@ -355,21 +259,13 @@ class ChaseControllerNode(Node):
             self.latest_own_cam_bbox = tuple(target.xyxy[0].tolist())
             self.latest_own_cam_conf = float(target.conf[0])
             self.latest_own_cam_stamp = now
-            x1, _, x2, _ = self.latest_own_cam_bbox
-            u_center = (x1 + x2) / 2.0
-            self.last_known_bearing_sign = 1 if (u_center - frame.shape[1] / 2.0) >= 0 else -1
             if self.latest_own_cam_conf >= self.own_cam_confirm_conf:
                 self.own_cam_confirm_count = min(self.own_cam_confirm_count + 1, self.own_cam_confirm_frames)
             else:
                 self.own_cam_confirm_count = 0
-
-            self.latest_bearing_angle = math.atan2(u_center - self.cx, self.fx)
-            self._update_bearing_rate_estimate(now)
-            self._update_range_rate_estimate(self._sample_depth_at_bbox_center(now), now)
         else:
             self.locked_track_id = None
             self.own_cam_confirm_count = 0
-            self._reset_feedforward_state()
 
         if self.publish_debug_image:
             overlay = results[0].plot()
@@ -386,19 +282,8 @@ class ChaseControllerNode(Node):
         now = self.get_clock().now()
         if self.state == PHASE1_APPROACH:
             self.tick_phase1(now)
-            return
-
-        twist = self.tick_phase2(now)
-        twist = self._apply_lidar_avoidance(twist, now)
-        twist = self._apply_lidar_safety(twist, now)
-
-        if self.enable_cmd_vel:
-            self.cmd_pub.publish(twist)
         else:
-            self.get_logger().info(
-                f'[DRY RUN] state={self.state} would publish lin={twist.linear.x:.3f} '
-                f'ang={twist.angular.z:.3f}', throttle_duration_sec=1.0,
-            )
+            self.tick_phase2(now)
 
     def tick_phase1(self, now):
         handoff_ok = self.own_cam_confirm_count >= self.own_cam_confirm_frames
@@ -412,7 +297,6 @@ class ChaseControllerNode(Node):
             self._publish_handoff_event()
             self._cancel_nav2_goal_if_active()
             self.state = PHASE2_FOLLOW
-            self.search_start_time = None
             return
 
         webcam_fresh = (
@@ -437,49 +321,34 @@ class ChaseControllerNode(Node):
             self._cancel_nav2_goal_if_active()
             self._set_explore_resume(False)
 
-    def tick_phase2(self, now) -> Twist:
-        have_detection = (
-            self.latest_own_cam_stamp is not None
-            and (now - self.latest_own_cam_stamp) < Duration(seconds=self.detection_loss_timeout)
+    def tick_phase2(self, now):
+        """PHASE2: still webcam-driven, like PHASE1, but the goal is offset back along
+        the robot->target line by target_distance so the robot stops short of the car
+        instead of driving into it. Requires knowing our own position (from odom) to
+        compute that offset."""
+        webcam_fresh = (
+            self.latest_webcam_target is not None and self.latest_webcam_stamp is not None
+            and (now - self.latest_webcam_stamp) <= Duration(seconds=self.webcam_stale_timeout)
         )
-        if not have_detection:
-            return self._search_twist(now)
+        if not webcam_fresh or self.latest_odom_xy is None:
+            self._cancel_nav2_goal_if_active()
+            return
 
-        self.search_start_time = None
-        bearing_angle = self.latest_bearing_angle
+        target_x = self.latest_webcam_target.x
+        target_y = self.latest_webcam_target.y
+        robot_x, robot_y = self.latest_odom_xy
+        dx = target_x - robot_x
+        dy = target_y - robot_y
+        dist = math.hypot(dx, dy)
 
-        twist = Twist()
-        ang_cmd = -self.phase2_kp_ang * bearing_angle + self.phase2_ff_gain_ang * self.bearing_rate_est
-        twist.angular.z = clamp(ang_cmd, -self.phase2_max_ang, self.phase2_max_ang)
+        if dist <= self.target_distance:
+            return  # already within the standoff distance - hold, don't crowd the car
 
-        z = self._sample_depth_at_bbox_center(now)
-        if z is None:
-            twist.linear.x = 0.0
-        else:
-            err = z - self.target_distance
-            ff_lin = self.phase2_ff_gain_lin * self.range_rate_est
-            if abs(err) < self.distance_deadband:
-                twist.linear.x = 0.0
-            elif err > 0:
-                twist.linear.x = clamp(self.phase2_kp_lin * err + ff_lin, 0.0, self.phase2_max_lin)
-            elif self.allow_reverse:
-                twist.linear.x = clamp(self.phase2_kp_lin * err + ff_lin, -self.phase2_max_lin_reverse, 0.0)
-            else:
-                twist.linear.x = 0.0
-        return twist
-
-    def _search_twist(self, now) -> Twist:
-        if self.search_start_time is None:
-            self.search_start_time = now
-            self.get_logger().warn('car lost on own camera - starting rotate-search')
-        if (now - self.search_start_time) > Duration(seconds=self.search_timeout_sec):
-            self.get_logger().error(
-                'search timed out - stopping and waiting for re-acquisition', throttle_duration_sec=5.0,
-            )
-            return Twist()
-        twist = Twist()
-        twist.angular.z = self.search_ang_speed * self.last_known_bearing_sign
-        return twist
+        ratio = (dist - self.target_distance) / dist
+        goal_x = robot_x + dx * ratio
+        goal_y = robot_y + dy * ratio
+        yaw = math.atan2(dy, dx)
+        self._maybe_send_nav2_goal(goal_x, goal_y, yaw=yaw)
 
     def _sample_depth_at_bbox_center(self, now=None):
         if self.latest_own_cam_bbox is None or self.latest_depth_image is None:
@@ -489,71 +358,6 @@ class ChaseControllerNode(Node):
         x1, y1, x2, y2 = self.latest_own_cam_bbox
         u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
         return sample_depth_patch(self.latest_depth_image, u, v, self.depth_patch_size, self.depth_scale)
-
-    def _update_bearing_rate_estimate(self, now):
-        """EMA-smoothed d(bearing)/dt, compensated for the robot's own yaw rate so the
-        estimate reflects the target's motion rather than our own rotation."""
-        if self.prev_bearing_time is not None:
-            dt = (now - self.prev_bearing_time).nanoseconds * 1e-9
-            if dt > 1e-3:
-                raw_rate = (
-                    normalize_angle(self.latest_bearing_angle - self.prev_bearing_angle) / dt
-                    + self.latest_odom_yaw_rate
-                )
-                a = self.ff_smoothing_alpha
-                self.bearing_rate_est = a * raw_rate + (1.0 - a) * self.bearing_rate_est
-        self.prev_bearing_angle = self.latest_bearing_angle
-        self.prev_bearing_time = now
-
-    def _update_range_rate_estimate(self, range_m, now):
-        """EMA-smoothed d(range)/dt, compensated for the robot's own forward speed."""
-        if range_m is not None and self.prev_range_time is not None:
-            dt = (now - self.prev_range_time).nanoseconds * 1e-9
-            if dt > 1e-3:
-                raw_rate = (range_m - self.prev_range_m) / dt + self.latest_odom_lin_vel
-                a = self.ff_smoothing_alpha
-                self.range_rate_est = a * raw_rate + (1.0 - a) * self.range_rate_est
-        if range_m is not None:
-            self.prev_range_m = range_m
-            self.prev_range_time = now
-
-    def _reset_feedforward_state(self):
-        self.prev_bearing_angle = None
-        self.prev_bearing_time = None
-        self.bearing_rate_est = 0.0
-        self.prev_range_m = None
-        self.prev_range_time = None
-        self.range_rate_est = 0.0
-
-    def _apply_lidar_avoidance(self, twist: Twist, now) -> Twist:
-        """Steer away from whichever side (left/right) is closer once an obstacle enters
-        lidar_avoid_trigger_distance, instead of just hard-stopping at lidar_safety_stop_distance."""
-        if (self.latest_lidar_stamp is None
-                or (now - self.latest_lidar_stamp) > Duration(seconds=self.lidar_stale_timeout)):
-            return twist
-        if self.latest_lidar_min_front >= self.lidar_avoid_trigger_distance:
-            return twist
-        span = self.lidar_avoid_trigger_distance - self.lidar_safety_stop_distance
-        if span <= 0:
-            return twist  # misconfigured (trigger <= stop distance) - skip, hard stop still applies
-        closeness = clamp((self.lidar_avoid_trigger_distance - self.latest_lidar_min_front) / span, 0.0, 1.0)
-        imbalance = clamp(self.latest_lidar_min_right - self.latest_lidar_min_left, -1.0, 1.0)
-        bias = -self.lidar_avoid_kp * closeness * imbalance
-        twist.angular.z = clamp(twist.angular.z + bias, -self.phase2_max_ang, self.phase2_max_ang)
-        return twist
-
-    def _apply_lidar_safety(self, twist: Twist, now) -> Twist:
-        if (self.latest_lidar_min_front is None or self.latest_lidar_stamp is None
-                or (now - self.latest_lidar_stamp) > Duration(seconds=self.lidar_stale_timeout)):
-            return twist  # no fresh lidar data - do not block, just skip the safety layer
-        if self.latest_lidar_min_front < self.lidar_safety_stop_distance:
-            if twist.linear.x > 0.0:
-                self.get_logger().warn(
-                    f'obstacle {self.latest_lidar_min_front:.2f}m ahead - blocking forward motion',
-                    throttle_duration_sec=1.0,
-                )
-            twist.linear.x = min(twist.linear.x, 0.0)
-        return twist
 
     def _publish_handoff_event(self):
         """Fire a brief RViz marker at the robot's own location when PHASE1 -> PHASE2
@@ -604,7 +408,7 @@ class ChaseControllerNode(Node):
         self._explore_resume_published = want_resume
         self.get_logger().info(f'EXPLORE: resume={want_resume}')
 
-    def _maybe_send_nav2_goal(self, x, y):
+    def _maybe_send_nav2_goal(self, x, y, yaw=None):
         if self._nav2_goal_pending:
             return  # still waiting on accept/reject for a previous send
 
@@ -620,9 +424,9 @@ class ChaseControllerNode(Node):
             self._nav2_last_goal_xy = (x, y)
             return
 
-        self._send_nav2_goal(x, y)
+        self._send_nav2_goal(x, y, yaw)
 
-    def _send_nav2_goal(self, x, y):
+    def _send_nav2_goal(self, x, y, yaw=None):
         if not self.nav2_action_client.server_is_ready():
             self.get_logger().warn('nav2 action server not ready yet, skipping goal', throttle_duration_sec=2.0)
             return
@@ -644,7 +448,11 @@ class ChaseControllerNode(Node):
         goal_msg.pose.header.stamp = Time().to_msg()
         goal_msg.pose.pose.position.x = x
         goal_msg.pose.pose.position.y = y
-        goal_msg.pose.pose.orientation.w = 1.0
+        if yaw is None:
+            goal_msg.pose.pose.orientation.w = 1.0
+        else:
+            goal_msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+            goal_msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
 
         self._nav2_goal_pending = True
         self.get_logger().info(f'NAV2: sending goal to ({x:.2f}, {y:.2f})')
@@ -735,12 +543,7 @@ class ChaseControllerNode(Node):
 
     def destroy_node(self):
         if rclpy.ok():
-            stop = Twist()
-            for _ in range(3):
-                try:
-                    self.cmd_pub.publish(stop)
-                except rclpy._rclpy_pybind11.RCLError:
-                    break  # context already torn down (e.g. Ctrl+C) - nothing more we can do
+            self._cancel_nav2_goal_if_active()
         if self.show_window:
             cv2.destroyAllWindows()
         super().destroy_node()

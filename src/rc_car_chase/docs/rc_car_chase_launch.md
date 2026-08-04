@@ -15,15 +15,10 @@ launch 인자(`DeclareLaunchArgument`)로 노출해서 커맨드라인에서 바
 | `webcam_model_path` | `/home/rokey/rokey_ws/best_v11.pt` | webcam_locator_node → `model_path` | 웹캠용 YOLO 가중치 |
 | `homography_yaml_path` | `.../config/webcam_homography.yaml` | webcam_locator_node → `homography_yaml_path` | 캘리브레이션 결과 파일 (웹캠 픽셀 → 지면좌표 변환용, PHASE1 자체는 Nav2가 주행하지만 타겟 위치 추정에는 여전히 이 호모그래피를 사용) |
 | `own_cam_model_path` | `.../car_dum_yolo11n_seqsplit/weights/best.pt` | chase_controller_node → `own_cam_model_path` | 자체 카메라용 YOLO 가중치 |
-| `target_distance` | `0.5` | chase_controller_node | PHASE2(자체 카메라) 목표 추종 거리 |
-| `own_cam_handoff_max_depth_m` | `0.7` | chase_controller_node | PHASE1→PHASE2 전환 조건: 자체 카메라 기준 이 거리 이내로 들어와야 전환 (전환 시 RViz에 이벤트 마커도 발행됨) |
+| `target_distance` | `0.6` | chase_controller_node | **PHASE2에서 웹캠 타겟으로부터 유지할 거리(Nav2 goal 오프셋)로 재사용됨.** PHASE1/PHASE2 둘 다 웹캠 타겟 기반 Nav2 goal로 주행하고, PHASE2만 타겟에서 이 거리만큼 못 미친 지점을 goal로 삼음 |
+| `own_cam_handoff_max_depth_m` | `0.7` | chase_controller_node | PHASE1→PHASE2 전환 조건: 자체 카메라 기준 이 거리 이내로 들어와야 전환 (전환 시 RViz에 이벤트 마커도 발행됨). **자체 카메라는 이제 이 핸드오프 판단에만 쓰이고, 주행 제어에는 안 쓰임** |
 | `own_cam_confirm_frames` | `4` | chase_controller_node | 핸드오프에 필요한 연속 확인 프레임 수 |
-| `detection_loss_timeout` | `1.5` | chase_controller_node | 탐지 유실 판정 시간 |
-| `phase2_max_lin` / `phase2_max_ang` | `0.15` / `0.6` | chase_controller_node | PHASE2 최대 속도 |
-| `phase2_ff_gain_ang` / `phase2_ff_gain_lin` | `0.0` / `0.0` | chase_controller_node | PHASE2 bearing/range 변화율 피드포워드 게인 (기본 0=비활성) |
-| `lidar_safety_stop_distance` | `0.6` | chase_controller_node | 라이다 하드정지 거리 (PHASE2에만 적용, PHASE1은 Nav2 costmap이 담당) |
-| `lidar_avoid_trigger_distance` | `0.9` | chase_controller_node | PHASE2 조향 회피가 시작되는 거리 (하드정지보다 커야 함) |
-| `odom_topic` | `/robot5/odom` | chase_controller_node | PHASE2 피드포워드 자기운동 보정용 오도메트리 토픽 |
+| `odom_topic` | `/robot5/odom` | chase_controller_node | PHASE2 goal 오프셋 계산에 쓰는 로봇 자기 위치 참조용 오도메트리 토픽 |
 | `enable_cmd_vel` | `false` | chase_controller_node | **실제 발행 여부 (SAFE DEFAULT 주석대로 기본은 항상 false)**. Nav2 목표 전송 및 explore resume도 함께 억제됨 |
 | `initial_state` | `PHASE1_APPROACH` | chase_controller_node | 시작 상태 |
 | `webcam_show_window` | `true` | webcam_locator_node → `show_window` | 웹캠 디버그 창 표시 |
@@ -41,7 +36,7 @@ launch 인자(`DeclareLaunchArgument`)로 노출해서 커맨드라인에서 바
 | `dock_status_topic` | `/robot5/dock_status` | chase_controller_node | 도킹 상태 구독 토픽 |
 | `undock_action_name` | `/robot5/undock` | chase_controller_node | `Undock` 액션 서버 이름 |
 
-> 위 표에 없는 나머지 파라미터(예: `fx`, `cx`, `depth_scale` 등)는 launch 인자로
+> 위 표에 없는 나머지 파라미터(예: `depth_scale` 등)는 launch 인자로
 > 노출되어 있지 않음 → 필요하면 `chase_controller_node.py`의 `_declare_parameters` 기본값을
 > 직접 고치거나, 별도 파라미터 YAML 파일을 만들어 launch에 추가해야 함.
 
@@ -127,19 +122,20 @@ calibrate_webcam_homography.py  ──► config/webcam_homography.yaml 생성
  │   webcam_locator_node    │        │      chase_controller_node       │
  │ (이 컴퓨터에 연결된 웹캠)  │        │                                   │
  │                           │        │  구독:                          │
- │ YOLO(웹캠 모델) 탐지/추적  │        │   - webcam_target (PHASE1)      │
- │ + homography 변환         │──────► │   - oakd rgb+depth (PHASE2)     │
- │                           │ /rc_   │   - scan (PHASE2 라이다 안전)   │
- │ 발행:                     │ car_   │                                 │
- │  /rc_car_chase/           │ chase/ │  발행/호출:                    │
- │   webcam_target           │ webcam_│   - /robot5/cmd_vel (PHASE2)   │
+ │ YOLO(웹캠 모델) 탐지/추적  │        │   - webcam_target (PHASE1+2 주행)│
+ │ + homography 변환         │──────► │   - oakd rgb+depth (핸드오프 확인)│
+ │                           │ /rc_   │   - odom (PHASE2 goal 오프셋용) │
+ │ 발행:                     │ car_   │   - dock_status (자동 언도킹)   │
+ │  /rc_car_chase/           │ chase/ │                                 │
+ │   webcam_target           │ webcam_│  발행/호출:                    │
  │   webcam_debug_image      │ target │   - /robot5/navigate_to_pose   │
- └──────────────────────────┘        │     액션 (PHASE1, Nav2로)      │
+ └──────────────────────────┘        │     액션 (PHASE1+2 둘 다 Nav2로)│
+                                      │   - /robot5/undock 액션        │
                                       │   - explore/resume (탐색 on/off)│
                                       │   - /rc_car_chase/debug_image  │
                                       └─────────────────────────────────┘
                                                │              ▲
-                                    Nav2 goal  │              │ (오도메트리/스캔/카메라, 로봇이 발행)
+                                    Nav2 goal  │              │ (오도메트리/카메라, 로봇이 발행)
                                                ▼              │
                                    ┌─────────────────────────────────┐
                                    │  nav2_stack.launch.py           │
@@ -151,8 +147,8 @@ calibrate_webcam_homography.py  ──► config/webcam_homography.yaml 생성
 ```
 
 - `webcam_locator_node`와 `chase_controller_node`는 **`vision_utils.py`의 함수들을 공유**하며 (자세한 내용은 [`vision_utils.md`](vision_utils.md)), 서로는 `/rc_car_chase/webcam_target` 토픽 하나로만 연결됨
-- PHASE1의 실제 주행/장애물 회피는 `chase_controller_node`가 아니라 **Nav2**(+`explore_lite`)가 담당한다 — 컨트롤러는 목표 좌표를 보내거나 탐색을 켜고 끄는 역할만 함
-- 로봇 자체(OAK-D 카메라, 라이다, `cmd_vel` 구독자)는 이 패키지 밖에서 이미 실행 중이어야 함 (TurtleBot4 기본 드라이버 등)
+- **PHASE1, PHASE2 둘 다** 실제 주행/장애물 회피는 `chase_controller_node`가 아니라 **Nav2**(+`explore_lite`)가 담당한다 — 컨트롤러는 목표 좌표를 계산해서 보내거나 탐색을 켜고 끄는 역할만 함. 자체 카메라(OAK-D)는 PHASE1→PHASE2 전환 확인 용도로만 쓰이고, 라이다는 이 패키지에서 직접 구독하지 않음(Nav2 costmap이 알아서 씀)
+- 로봇 자체(OAK-D 카메라, 라이다, 오도메트리)는 이 패키지 밖에서 이미 실행 중이어야 함 (TurtleBot4 기본 드라이버 등)
 - `chase_controller_node`에 대한 상세 설명은 [`chase_controller_node.md`](chase_controller_node.md), `webcam_locator_node`는 [`webcam_locator_node.md`](webcam_locator_node.md) 참고
 
 ---
@@ -163,7 +159,7 @@ calibrate_webcam_homography.py  ──► config/webcam_homography.yaml 생성
 - [ ] `webcam_device`가 실제 연결된 웹캠 경로와 일치하는가 (`ls /dev/video*`)
 - [ ] `own_cam_model_path`, `webcam_model_path`의 `.pt` 파일이 실제로 존재하는가
 - [ ] `turtlebot4_navigation`, `explore_lite` 패키지가 워크스페이스(또는 turtlebot4_ws)에 소싱되어 있는가 (`bringup_nav2_stack:=true`로 쓸 경우 필수)
-- [ ] 로봇 쪽에서 `/robot5/oakd/rgb/image_raw/compressed`, `/robot5/oakd/stereo/image_raw/compressedDepth`, `/robot5/scan`이 실제로 발행되고 있는가
+- [ ] 로봇 쪽에서 `/robot5/oakd/rgb/image_raw/compressed`, `/robot5/oakd/stereo/image_raw/compressedDepth`, `/robot5/odom`이 실제로 발행되고 있는가 (라이다는 Nav2가 직접 쓰니 Nav2 쪽에서 살아있으면 됨)
 - [ ] 웹캠 타겟 좌표(`nav2_goal_frame_id`, 기본 `odom`)와 `webcam_locator_node`가 발행하는 `PointStamped.header.frame_id`가 일치하는가
 - [ ] 처음 실행할 때는 `enable_cmd_vel:=false`(기본값)로 dry-run 로그만 확인 후, 안전 확인되면 `true`로 전환
 - [ ] `enable_autonomous_exploration`은 필요할 때만 `true`로 (기본은 자동 탐색 없이 대기)
