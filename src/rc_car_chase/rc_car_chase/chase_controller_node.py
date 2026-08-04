@@ -2,6 +2,7 @@ import math
 
 import cv2
 import message_filters
+import numpy as np
 import rclpy
 from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
@@ -134,6 +135,10 @@ class ChaseControllerNode(Node):
         self.debug_pub = (
             self.create_publisher(Image, self.debug_image_topic, 1) if self.publish_debug_image else None
         )
+        self.debug_depth_pub = (
+            self.create_publisher(CompressedImage, self.debug_depth_image_topic, 1)
+            if self.publish_debug_depth_image else None
+        )
         self.explore_resume_pub = self.create_publisher(Bool, self.explore_resume_topic, reliable_qos)
         self.handoff_event_pub = self.create_publisher(Marker, self.handoff_event_topic, 1)
         self.nav2_action_client = ActionClient(
@@ -177,6 +182,9 @@ class ChaseControllerNode(Node):
             'control_rate_hz': 10.0,
             'publish_debug_image': True,
             'debug_image_topic': '/rc_car_chase/debug_image',
+            'publish_debug_depth_image': True,
+            'debug_depth_image_topic': '/rc_car_chase/debug_depth_image/compressed',
+            'debug_depth_max_mm': 5000.0,
             'show_window': False,
             'enable_cmd_vel': False,
             'initial_state': PHASE1_APPROACH,
@@ -224,6 +232,9 @@ class ChaseControllerNode(Node):
         self.control_rate_hz = g('control_rate_hz')
         self.publish_debug_image = g('publish_debug_image')
         self.debug_image_topic = g('debug_image_topic')
+        self.publish_debug_depth_image = g('publish_debug_depth_image')
+        self.debug_depth_image_topic = g('debug_depth_image_topic')
+        self.debug_depth_max_mm = g('debug_depth_max_mm')
         self.show_window = g('show_window')
         self.enable_cmd_vel = g('enable_cmd_vel')
         self.initial_state = g('initial_state')
@@ -279,6 +290,7 @@ class ChaseControllerNode(Node):
                 self._depth_debug_printed = True
             self.latest_depth_image = depth_img
             self.latest_depth_stamp = now
+            self._publish_debug_depth(depth_img, depth_msg.header)
 
         self.frame_count += 1
         if self.frame_count % 30 == 1:
@@ -316,6 +328,27 @@ class ChaseControllerNode(Node):
             if self.show_window:
                 cv2.imshow('chase_controller', overlay)
                 cv2.waitKey(1)
+
+    def _publish_debug_depth(self, depth_img, header):
+        """Colorized depth visualization (16UC1 mm -> BGR heatmap), published as a
+        CompressedImage since the raw depth stream itself uses ROS's special
+        compressedDepth format that most viewers can't open directly - this is a
+        normal JPEG-compressed color image instead, viewable in rqt_image_view etc."""
+        if self.debug_depth_pub is None and not self.show_window:
+            return
+        clipped = np.clip(depth_img.astype(np.float32), 0, self.debug_depth_max_mm)
+        depth_8u = (clipped / self.debug_depth_max_mm * 255.0).astype(np.uint8)
+        depth_color = cv2.applyColorMap(depth_8u, cv2.COLORMAP_JET)
+        depth_color[depth_img == 0] = (0, 0, 0)  # invalid/no-return pixels -> black
+
+        if self.debug_depth_pub is not None:
+            out_msg = self.bridge.cv2_to_compressed_imgmsg(depth_color, dst_format='jpg')
+            out_msg.header = header
+            self.debug_depth_pub.publish(out_msg)
+
+        if self.show_window:
+            cv2.imshow('chase_controller_depth', depth_color)
+            cv2.waitKey(1)
 
     # ---------------------------------------------------------- control timer
 
