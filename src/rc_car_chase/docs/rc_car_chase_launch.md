@@ -18,6 +18,7 @@ launch 인자(`DeclareLaunchArgument`)로 노출해서 커맨드라인에서 바
 | `target_distance` | `0.6` | chase_controller_node | **PHASE2에서 웹캠 타겟으로부터 유지할 거리(Nav2 goal 오프셋)로 재사용됨.** PHASE1/PHASE2 둘 다 웹캠 타겟 기반 Nav2 goal로 주행하고, PHASE2만 타겟에서 이 거리만큼 못 미친 지점을 goal로 삼음 |
 | `own_cam_handoff_max_depth_m` | `0.7` | chase_controller_node | PHASE1→PHASE2 전환 조건: 자체 카메라 기준 이 거리 이내로 들어와야 전환 (전환 시 RViz에 이벤트 마커도 발행됨). **자체 카메라는 이제 이 핸드오프 판단에만 쓰이고, 주행 제어에는 안 쓰임** |
 | `own_cam_confirm_frames` | `4` | chase_controller_node | 핸드오프에 필요한 연속 확인 프레임 수 |
+| `own_cam_info_topic` | `/robot5/oakd/rgb/camera_info` | chase_controller_node | PHASE2 뎁스 fallback(웹캠 타겟 stale 시 자체카메라로 대체)의 픽셀→카메라좌표 변환용 |
 | `odom_topic` | `/robot5/odom` | chase_controller_node | PHASE2 goal 오프셋 계산에 쓰는 로봇 자기 위치 참조용 오도메트리 토픽 |
 | `enable_cmd_vel` | `false` | chase_controller_node | **실제 발행 여부 (SAFE DEFAULT 주석대로 기본은 항상 false)**. Nav2 목표 전송 및 explore resume도 함께 억제됨 |
 | `initial_state` | `PHASE1_APPROACH` | chase_controller_node | 시작 상태 |
@@ -66,9 +67,13 @@ Node(package='rc_car_chase', executable='webcam_locator_node', name='webcam_loca
 
 ### `controller_node`
 ```python
-Node(package='rc_car_chase', executable='chase_controller_node', name='chase_controller_node', ...)
+Node(package='rc_car_chase', executable='chase_controller_node', name='chase_controller_node', ...,
+     remappings=[('/tf', '/robot5/tf'), ('/tf_static', '/robot5/tf_static')])
 ```
 - 위 표의 파라미터들을 launch 인자로 매핑, 나머지는 노드 기본값 사용
+- `/tf`, `/tf_static`을 `/robot5/tf`, `/robot5/tf_static`으로 리매핑 — PHASE2 뎁스 fallback이
+  `tf2_ros.TransformListener`로 TF를 구독하는데, robot5의 TF는 네임스페이스가 붙은 토픽으로 발행되기
+  때문에 (rviz_node와 같은 이유)
 
 ### `rviz_node` (조건부, `bringup_rviz:=true`일 때)
 ```python

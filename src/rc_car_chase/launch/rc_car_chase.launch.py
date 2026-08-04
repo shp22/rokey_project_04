@@ -15,15 +15,23 @@ def generate_launch_description():
             'homography_yaml_path',
             default_value='/home/rokey/rokey_ws/src/rc_car_chase/config/webcam_homography.yaml',
         ),
+        # yolo11n, 100 epoch/patience 30 on car_dum_seqsplit - won the model comparison on
+        # F1(car)@conf=0.5 (0.978), the tracking-relevant metric (see model_comparison_results/).
+        # TensorRT FP16 engine: ~3x faster (4.69ms -> 1.55ms) for ~0.02 lower F1 - negligible
+        # accuracy cost for this real-time control loop.
         DeclareLaunchArgument(
             'own_cam_model_path',
-            default_value='/home/rokey/rokey_ws/runs/detect/runs_train/car_dum_yolo11n_seqsplit/weights/best.pt',
+            default_value=(
+                '/home/rokey/rokey_ws/runs/detect/runs/detect/model_compare_100ep/'
+                'yolo11n/weights/best.engine'
+            ),
         ),
         # target_distance doubles as the PHASE2 standoff offset - both phases drive off
         # the webcam target, PHASE2 just aims target_distance short of it (see node docs).
         DeclareLaunchArgument('target_distance', default_value='0.6'),
         DeclareLaunchArgument('own_cam_handoff_max_depth_m', default_value='0.7'),
         DeclareLaunchArgument('own_cam_confirm_frames', default_value='4'),
+        DeclareLaunchArgument('own_cam_info_topic', default_value='/robot5/oakd/rgb/camera_info'),
         DeclareLaunchArgument('odom_topic', default_value='/robot5/odom'),
         DeclareLaunchArgument('enable_cmd_vel', default_value='false'),   # SAFE DEFAULT
         DeclareLaunchArgument('initial_state', default_value='PHASE1_APPROACH'),
@@ -42,6 +50,9 @@ def generate_launch_description():
         ),
         # Nav2 / explore_lite
         DeclareLaunchArgument('bringup_nav2_stack', default_value='true'),
+        # true = SLAM (fresh map each run), false = AMCL localization against `map` below.
+        DeclareLaunchArgument('use_slam', default_value='true'),
+        DeclareLaunchArgument('map', default_value='/home/rokey/rokey_ws/maps/turtle5_map.yaml'),
         DeclareLaunchArgument('nav2_action_name', default_value='/robot5/navigate_to_pose'),
         DeclareLaunchArgument('explore_resume_topic', default_value='/robot5/explore/resume'),
         DeclareLaunchArgument('nav2_goal_update_threshold_m', default_value='0.5'),
@@ -56,6 +67,10 @@ def generate_launch_description():
     nav2_stack = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(PathJoinSubstitution(
             [FindPackageShare('rc_car_chase'), 'launch', 'nav2_stack.launch.py'])),
+        launch_arguments={
+            'use_slam': LaunchConfiguration('use_slam'),
+            'map': LaunchConfiguration('map'),
+        }.items(),
         condition=IfCondition(LaunchConfiguration('bringup_nav2_stack')),
     )
 
@@ -79,6 +94,7 @@ def generate_launch_description():
             'target_distance': LaunchConfiguration('target_distance'),
             'own_cam_handoff_max_depth_m': LaunchConfiguration('own_cam_handoff_max_depth_m'),
             'own_cam_confirm_frames': LaunchConfiguration('own_cam_confirm_frames'),
+            'own_cam_info_topic': LaunchConfiguration('own_cam_info_topic'),
             'odom_topic': LaunchConfiguration('odom_topic'),
             'enable_cmd_vel': LaunchConfiguration('enable_cmd_vel'),
             'initial_state': LaunchConfiguration('initial_state'),
@@ -92,6 +108,10 @@ def generate_launch_description():
             'dock_status_topic': LaunchConfiguration('dock_status_topic'),
             'undock_action_name': LaunchConfiguration('undock_action_name'),
         }],
+        # robot5's TF is published on the namespaced /robot5/tf topics, not the bare /tf
+        # this node's TransformListener subscribes to by default - needed for the PHASE2
+        # own-camera depth->world fallback (see chase_controller_node docs).
+        remappings=[('/tf', '/robot5/tf'), ('/tf_static', '/robot5/tf_static')],
     )
 
     rviz_node = Node(

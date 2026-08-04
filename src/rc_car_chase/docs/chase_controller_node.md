@@ -1,10 +1,15 @@
 # `chase_controller_node.py` 상세 설명
 
-RC카 추적의 **메인 컨트롤러**. **PHASE1(장거리)도 PHASE2(근거리)도 둘 다 웹캠이 알려준 타겟 좌표를
+RC카 추적의 **메인 컨트롤러**. **PHASE1(장거리)도 PHASE2(근거리)도 둘 다 타겟 월드좌표를
 Nav2(`NavigateToPose` 액션)로 넘겨 자율주행에 맡기는 상태 머신 노드.** 차이는 딱 하나 — PHASE1은
 타겟 좌표 그대로 goal을 보내고, PHASE2는 로봇→타겟 방향으로 `target_distance`만큼 못 미친 지점을
-goal로 보내서 차와 일정 거리(기본 0.6m)를 유지하며 따라간다. 자체 OAK-D 카메라(YOLO+뎁스)는 이제
-**주행 제어에는 안 쓰이고**, "차가 실제로 가까이 왔는지" PHASE1→PHASE2 전환을 확정하는 용도로만 쓰인다.
+goal로 보내서 차와 일정 거리(기본 0.6m)를 유지하며 따라간다.
+
+타겟 좌표의 **주 출처는 웹캠**(고정 외부 카메라 + 호모그래피)이고, 자체 OAK-D 카메라(YOLO+뎁스)는
+기본적으로 "차가 실제로 가까이 왔는지" PHASE1→PHASE2 전환을 확정하는 용도로만 쓰인다. 다만 PHASE2에서
+**웹캠 타겟이 stale해지면**(예: 차가 로봇 바로 앞이라 고정 웹캠 시야를 벗어난 경우) 자체 카메라의
+뎁스를 카메라 내부파라미터(`CameraInfo`)와 TF로 월드좌표로 변환해 **자동으로 fallback**한다
+(`_update_own_cam_world_fallback`).
 
 ---
 
@@ -29,6 +34,7 @@ goal로 보내서 차와 일정 거리(기본 0.6m)를 유지하며 따라간다
 |---|---|---|
 | `own_cam_rgb_topic` | `/robot5/oakd/rgb/image_raw/compressed` | 자체 RGB 카메라 압축 이미지 토픽 |
 | `own_cam_depth_topic` | `/robot5/oakd/stereo/image_raw/compressedDepth` | 자체 뎁스 이미지 토픽 (압축뎁스) |
+| `own_cam_info_topic` | `/robot5/oakd/rgb/camera_info` | 자체 카메라 내부파라미터(K 행렬) 토픽 — PHASE2 뎁스 fallback의 픽셀→카메라좌표 변환에 사용 |
 | `webcam_target_topic` | `/rc_car_chase/webcam_target` | `webcam_locator_node`가 발행하는 타겟 월드좌표 토픽 |
 | `own_cam_model_path` | `.../car_dum_yolo11n_seqsplit/weights/best.pt` | 자체 카메라용 YOLO 가중치 경로 (핸드오프 확인용) |
 | `tracker` | `bytetrack.yaml` | Ultralytics 트래커 설정 |
@@ -105,6 +111,9 @@ goal로 보내서 차와 일정 거리(기본 0.6m)를 유지하며 따라간다
 | `self.state` | `tick_phase1` | 현재 상태 (`PHASE1_APPROACH` / `PHASE2_FOLLOW`) |
 | `self.latest_webcam_target`, `self.latest_webcam_stamp` | `on_webcam_target` | 웹캠이 알려준 최신 타겟 좌표와 수신 시각 — PHASE1/PHASE2 모두 이걸로 주행 |
 | `self.latest_odom_xy` | `on_odom` | 로봇 자신의 현재 위치 (`nav2_goal_frame_id`와 같은 프레임의 odom `pose.pose.position`) — PHASE2 오프셋 계산용 |
+| `self.own_cam_K`, `self.own_cam_frame_id` | `on_own_cam_info` | 자체 카메라 내부파라미터(fx, fy, cx, cy)와 그 좌표계의 TF 프레임 이름 — 뎁스 fallback 변환에 사용 |
+| `self.latest_own_cam_world_xy`, `self.latest_own_cam_world_stamp` | `_update_own_cam_world_fallback` | 자체 카메라 뎁스를 TF로 `nav2_goal_frame_id`에 투영한 월드좌표와 시각 — PHASE2에서 웹캠 타겟이 stale할 때 fallback 타겟으로 사용 |
+| `self.tf_buffer`, `self.tf_listener` | (프레임워크가 자동 갱신) | `tf2_ros.Buffer`/`TransformListener` — 뎁스 fallback의 카메라→`nav2_goal_frame_id` 변환에 사용 |
 | `self.latest_own_cam_bbox`, `self.latest_own_cam_conf`, `self.latest_own_cam_stamp` | `on_oakd_synced` | 자체 카메라 최신 타겟 바운딩박스/신뢰도/시각 (핸드오프 판단 전용) |
 | `self.latest_depth_image`, `self.latest_depth_stamp` | `on_oakd_synced` | 최신 디코딩된 뎁스 이미지와 시각 (핸드오프 판단 전용) |
 | `self.own_cam_confirm_count` | `on_oakd_synced` | 고신뢰도 연속 탐지 카운트 (핸드오프 판단용) |
@@ -138,6 +147,7 @@ goal로 보내서 차와 일정 거리(기본 0.6m)를 유지하며 따라간다
 | `on_webcam_target(msg)` | cb_light | 웹캠 타겟 좌표 캐싱 |
 | `on_dock_status(msg)` | cb_light | 도킹 상태(`is_docked`)와 수신 시각 캐싱 |
 | `on_odom(msg)` | cb_light | `msg.pose.pose.position`을 그대로 캐싱 (속도 적분 없음, 순수 현재 위치 참조용) |
+| `on_own_cam_info(msg)` | cb_light | `msg.k`에서 fx, fy, cx, cy 추출 + `msg.header.frame_id` 캐싱 (뎁스 fallback용) |
 | `on_oakd_synced(rgb_msg, depth_msg)` | cb_vision (message_filters 동기화 콜백) | 아래 "5. `on_oakd_synced` 상세" 참고 |
 
 ### 제어 루프
@@ -146,8 +156,9 @@ goal로 보내서 차와 일정 거리(기본 0.6m)를 유지하며 따라간다
 |---|---|
 | `on_control_timer` | 매 `1/control_rate_hz` 초마다 실행. `PHASE1_APPROACH`면 `tick_phase1`, 아니면 `tick_phase2` 호출. **어느 쪽도 twist를 직접 발행하지 않음** — 실제 주행은 전부 Nav2에 위임 |
 | `tick_phase1(now)` | **PHASE1 로직**: 핸드오프 조건(6번 참고) 확인 → 만족하면 `_publish_handoff_event()` 발행, 진행 중인 Nav2 목표 취소, PHASE2로 전환 후 리턴. 아니면 웹캠 타겟 신선도로 분기: 신선하고 `auto_undock=True`이며 아직 도킹 상태면 `UNDOCKING`(언도킹 goal 전송); 신선하면(언도킹 불필요) `NAVIGATING_TO_TARGET`(타겟 좌표 그대로 Nav2 목표 전송, `_maybe_send_nav2_goal`); 안 신선하고 `enable_autonomous_exploration=True`면 `EXPLORING`(Nav2 목표 취소 + explore resume 켬); 둘 다 아니면 `IDLE`(Nav2 목표 취소 + explore resume 끔) |
-| `tick_phase2(now)` | **PHASE2 로직**: 웹캠 타겟이 안 신선하거나 자기 위치(`latest_odom_xy`)를 모르면 진행 중인 Nav2 목표 취소하고 리턴. 그 외엔 로봇→타겟 벡터 `(dx, dy)`와 거리 `dist`를 계산 → `dist <= target_distance`면 이미 충분히 가까우니 아무것도 안 함(붙지 않도록) → 아니면 그 직선상에서 타겟으로부터 `target_distance`만큼 못 미친 지점 `(goal_x, goal_y)`와 타겟을 바라보는 방향 `yaw = atan2(dy, dx)`를 계산해 `_maybe_send_nav2_goal(goal_x, goal_y, yaw=yaw)` 호출 |
-| `_sample_depth_at_bbox_center(now)` | 현재 바운딩박스 중심 픽셀에서 뎁스 패치 샘플링 (`vision_utils.sample_depth_patch` 호출). 뎁스가 stale하거나 없으면 `None` — **PHASE1→PHASE2 핸드오프 판단에만 쓰임** |
+| `tick_phase2(now)` | **PHASE2 로직**: 타겟 좌표 출처를 결정 — 웹캠 타겟이 신선하면 그걸 씀; 안 신선한데 `latest_own_cam_world_xy`가 신선하면(뎁스 fallback) 그걸 대신 씀; 둘 다 없으면 Nav2 목표 취소하고 리턴. 자기 위치(`latest_odom_xy`)도 모르면 마찬가지로 취소 후 리턴. 그 외엔 로봇→타겟 벡터 `(dx, dy)`와 거리 `dist`를 계산 → `dist <= target_distance`면 이미 충분히 가까우니 아무것도 안 함(붙지 않도록) → 아니면 그 직선상에서 타겟으로부터 `target_distance`만큼 못 미친 지점 `(goal_x, goal_y)`와 타겟을 바라보는 방향 `yaw = atan2(dy, dx)`를 계산해 `_maybe_send_nav2_goal(goal_x, goal_y, yaw=yaw)` 호출 |
+| `_sample_depth_at_bbox_center(now)` | 현재 바운딩박스 중심 픽셀에서 뎁스 패치 샘플링 (`vision_utils.sample_depth_patch` 호출). 뎁스가 stale하거나 없으면 `None` — 핸드오프 판단과 뎁스 fallback 둘 다에 쓰임 |
+| `_update_own_cam_world_fallback(now)` | `own_cam_K`/`own_cam_frame_id`가 아직 없으면 스킵. bbox 중심 픽셀 `(u,v)`와 뎁스 `z`로 카메라 좌표계 3D 점 `((u-cx)*z/fx, (v-cy)*z/fy, z)`을 만들어 `PointStamped`(stamp는 0, "최신 변환 사용" 의미)로 감싼 뒤 `tf_buffer.transform(...)`으로 `nav2_goal_frame_id`로 변환. 변환 실패 시 경고 로그만 남기고 스킵, 성공하면 `latest_own_cam_world_xy`/`_stamp` 갱신 |
 | `_publish_handoff_event()` | PHASE1→PHASE2 전환 순간 `base_link` 프레임 기준으로 노란 구(SPHERE) + `"HANDOFF: PHASE2_FOLLOW"` 텍스트(TEXT_VIEW_FACING) 마커를 `handoff_event_topic`에 발행 (수명 2초짜리 일회성 플래시) |
 
 ### Nav2 / explore_lite 연동
@@ -174,19 +185,19 @@ goal로 보내서 차와 일정 거리(기본 0.6m)를 유지하며 따라간다
 
 ---
 
-## 5. `on_oakd_synced` 상세 (핸드오프 확인 전용)
+## 5. `on_oakd_synced` 상세 (핸드오프 확인 + 뎁스 fallback 계산)
 
 `message_filters.ApproximateTimeSynchronizer`가 RGB와 뎁스를 시간 맞춰 동시에 넘겨줄 때 호출됨.
-**여기서 계산되는 값들은 오직 PHASE1→PHASE2 핸드오프 판단(6번)에만 쓰이고, 실제 주행 방향/속도
-계산엔 관여하지 않는다** (그건 전부 웹캠 타겟 기반으로 `tick_phase1`/`tick_phase2`가 함).
+**여기서 계산되는 값들은 PHASE1→PHASE2 핸드오프 판단(6번)과 PHASE2 뎁스 fallback(`latest_own_cam_world_xy`)에
+쓰이고, 웹캠 타겟이 살아있는 한 실제 주행 방향/속도 계산엔 관여하지 않는다.**
 
 1. RGB 압축 이미지를 `bgr8` OpenCV 이미지로 디코딩
 2. 뎁스는 `decode_compressed_depth`로 디코딩. 실패하면 경고만 찍고 계속 진행
 3. 뎁스 디코딩 성공 시, **최초 1회만** dtype/min/max/nonzero_min을 로그로 출력해서 `depth_scale` 파라미터가 실제 데이터 단위와 맞는지 검증할 수 있게 함
 4. `own_cam_model.track()`으로 YOLO+ByteTrack 추론
 5. `select_target_box`로 최종 타겟 박스 선택
-   - 있으면: bbox/신뢰도/시각 캐싱, 신뢰도가 `own_cam_confirm_conf` 이상이면 `own_cam_confirm_count` 증가(최대 `own_cam_confirm_frames`), 아니면 리셋
-   - 없으면: 락 해제, 카운트 리셋
+   - 있으면: bbox/신뢰도/시각 캐싱, 신뢰도가 `own_cam_confirm_conf` 이상이면 `own_cam_confirm_count` 증가(최대 `own_cam_confirm_frames`), 아니면 리셋. 이어서 `_update_own_cam_world_fallback(now)` 호출해 뎁스 fallback 좌표 갱신
+   - 없으면: 락 해제, 카운트 리셋 (fallback 좌표는 갱신 안 됨 — `depth_stale_timeout` 지나면 `tick_phase2`가 알아서 stale로 판단)
 6. `publish_debug_image=True`면 오버레이 이미지를 만들어 발행(+옵션으로 로컬 창 표시)
 
 ---
@@ -206,9 +217,10 @@ PHASE1_APPROACH  (goal = 웹캠 타겟 좌표 그대로)
        → 진행 중인 Nav2 목표 취소
        ─────────────────────────────────────────────► PHASE2_FOLLOW
 
-PHASE2_FOLLOW  (goal = 웹캠 타겟에서 로봇 방향으로 target_distance만큼 못 미친 지점)
-  └─ 웹캠 타겟이 계속 신선하게 들어오는 한 계속 그 오프셋 지점으로 재접근
-  └─ 웹캠 타겟이 stale해지거나 자기 위치를 모르면 → 진행 중인 Nav2 목표 취소하고 대기
+PHASE2_FOLLOW  (goal = 타겟에서 로봇 방향으로 target_distance만큼 못 미친 지점)
+  ├─ 웹캠 타겟 fresh                          → 웹캠 좌표로 오프셋 goal 계산
+  ├─ 웹캠 타겟 stale + 뎁스 fallback 좌표 fresh → 자체카메라 뎁스→월드 좌표로 오프셋 goal 계산
+  └─ 둘 다 없음 (또는 자기 위치를 모름)         → 진행 중인 Nav2 목표 취소하고 대기
 ```
 
 ※ PHASE2 → PHASE1로 되돌아가는 로직은 없음 (한 번 핸드오프되면 계속 PHASE2로 남음).

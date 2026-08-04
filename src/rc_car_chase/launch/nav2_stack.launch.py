@@ -7,7 +7,7 @@ file resolves turtlebot4_navigation's share directory via FindPackageShare).
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -19,6 +19,14 @@ def generate_launch_description():
         DeclareLaunchArgument('namespace', default_value='robot5'),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('slam_sync', default_value='true'),
+        # true (default) = SLAM, build a fresh map every run.
+        # false = localization (AMCL) against the saved `map` yaml below - faster startup,
+        # no repeated mapping, but the saved map must already cover the space you drive in.
+        DeclareLaunchArgument('use_slam', default_value='true'),
+        DeclareLaunchArgument(
+            'map',
+            default_value='/home/rokey/rokey_ws/maps/turtle5_map.yaml',
+        ),
         # Keep this false for a first cautious bring-up (SLAM+Nav2 only, stage (a) of the
         # verification plan) - explore_lite starts exploring on its own as soon as it's up,
         # with no external node here to hold it paused via explore/resume.
@@ -32,6 +40,11 @@ def generate_launch_description():
             'slam_params_file',
             default_value=PathJoinSubstitution(
                 [FindPackageShare('turtlebot4_navigation'), 'config', 'slam.yaml']),
+        ),
+        DeclareLaunchArgument(
+            'localization_params_file',
+            default_value=PathJoinSubstitution(
+                [FindPackageShare('turtlebot4_navigation'), 'config', 'localization.yaml']),
         ),
         DeclareLaunchArgument(
             'explore_params_file',
@@ -49,6 +62,19 @@ def generate_launch_description():
             'sync': LaunchConfiguration('slam_sync'),
             'params': LaunchConfiguration('slam_params_file'),
         }.items(),
+        condition=IfCondition(LaunchConfiguration('use_slam')),
+    )
+
+    localization = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(PathJoinSubstitution(
+            [FindPackageShare('turtlebot4_navigation'), 'launch', 'localization.launch.py'])),
+        launch_arguments={
+            'namespace': LaunchConfiguration('namespace'),
+            'use_sim_time': LaunchConfiguration('use_sim_time'),
+            'map': LaunchConfiguration('map'),
+            'params': LaunchConfiguration('localization_params_file'),
+        }.items(),
+        condition=UnlessCondition(LaunchConfiguration('use_slam')),
     )
 
     nav2 = IncludeLaunchDescription(
@@ -76,4 +102,4 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('bringup_explore')),
     )
 
-    return LaunchDescription(args + [slam, nav2, explore_node])
+    return LaunchDescription(args + [slam, localization, nav2, explore_node])

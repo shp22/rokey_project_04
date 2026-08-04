@@ -16,8 +16,10 @@ from irobot_create_msgs.action import Undock
 from irobot_create_msgs.msg import DockStatus
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import CompressedImage, Image
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from std_msgs.msg import Bool
+from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_point  # noqa: F401  (registers PointStamped support)
+from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker
 from cv_bridge import CvBridge
 from ultralytics import YOLO
@@ -33,6 +35,10 @@ SUB_MODE_NAVIGATING = 'NAVIGATING_TO_TARGET'
 SUB_MODE_UNDOCKING = 'UNDOCKING'
 
 
+def quaternion_to_yaw(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
 class ChaseControllerNode(Node):
     def __init__(self):
         super().__init__('chase_controller_node')
@@ -43,6 +49,8 @@ class ChaseControllerNode(Node):
         self.get_logger().info(f'Loading own-camera model: {self.own_cam_model_path}')
         self.own_cam_model = YOLO(self.own_cam_model_path)
         self.bridge = CvBridge()
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         # ---- cached sensor state (updated by callbacks, consumed by control timer) ----
         self.state = self.initial_state
@@ -53,6 +61,10 @@ class ChaseControllerNode(Node):
         self.latest_own_cam_stamp = None
         self.latest_depth_image = None
         self.latest_depth_stamp = None
+        self.own_cam_K = None  # (fx, fy, cx, cy) from CameraInfo, once received
+        self.own_cam_frame_id = None
+        self.latest_own_cam_world_xy = None
+        self.latest_own_cam_world_stamp = None
         self.own_cam_confirm_count = 0
         self.locked_track_id = None
         self._depth_debug_printed = False
@@ -60,6 +72,13 @@ class ChaseControllerNode(Node):
         self.latest_is_docked = None
         self.latest_dock_stamp = None
         self.latest_odom_xy = None
+        self.latest_odom_yaw = None
+
+        # ---- PHASE2 rotate-search state (both webcam and own-cam fallback lost) ----
+        self._search_active = False
+        self._search_base_yaw = None
+        self._search_toggle = False
+        self._search_last_sent_time = None
 
         # ---- Nav2 / explore_lite state ----
         self._nav2_goal_handle = None
@@ -94,6 +113,10 @@ class ChaseControllerNode(Node):
         )
         self.create_subscription(
             Odometry, self.odom_topic, self.on_odom, reliable_qos,
+            callback_group=cb_light,
+        )
+        self.create_subscription(
+            CameraInfo, self.own_cam_info_topic, self.on_own_cam_info, reliable_qos,
             callback_group=cb_light,
         )
 
@@ -133,6 +156,7 @@ class ChaseControllerNode(Node):
         defaults = {
             'own_cam_rgb_topic': '/robot5/oakd/rgb/image_raw/compressed',
             'own_cam_depth_topic': '/robot5/oakd/stereo/image_raw/compressedDepth',
+            'own_cam_info_topic': '/robot5/oakd/rgb/camera_info',
             'webcam_target_topic': '/rc_car_chase/webcam_target',
             'own_cam_model_path':
                 '/home/rokey/rokey_ws/runs/detect/runs_train/car_dum_yolo11n_seqsplit/weights/best.pt',
@@ -165,6 +189,13 @@ class ChaseControllerNode(Node):
             'dock_status_topic': '/robot5/dock_status',
             'undock_action_name': '/robot5/undock',
             'auto_undock': True,
+            'search_sweep_deg': 45.0,
+            'search_goal_resend_interval_sec': 4.0,
+            # PHASE2 is close-range following (target_distance is typically well under 1m),
+            # so it needs a much finer goal-resend threshold than PHASE1's long-range
+            # approach - otherwise the car can drift most of the way to target_distance
+            # before a correction is even sent.
+            'phase2_goal_update_threshold_m': 0.1,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
@@ -173,6 +204,7 @@ class ChaseControllerNode(Node):
         g = lambda n: self.get_parameter(n).value  # noqa: E731
         self.own_cam_rgb_topic = g('own_cam_rgb_topic')
         self.own_cam_depth_topic = g('own_cam_depth_topic')
+        self.own_cam_info_topic = g('own_cam_info_topic')
         self.webcam_target_topic = g('webcam_target_topic')
         self.own_cam_model_path = g('own_cam_model_path')
         self.own_cam_conf_threshold = g('own_cam_conf_threshold')
@@ -204,6 +236,9 @@ class ChaseControllerNode(Node):
         self.dock_status_topic = g('dock_status_topic')
         self.undock_action_name = g('undock_action_name')
         self.auto_undock = g('auto_undock')
+        self.search_sweep_deg = g('search_sweep_deg')
+        self.search_goal_resend_interval_sec = g('search_goal_resend_interval_sec')
+        self.phase2_goal_update_threshold_m = g('phase2_goal_update_threshold_m')
 
     # --------------------------------------------------------------- callbacks
 
@@ -216,10 +251,15 @@ class ChaseControllerNode(Node):
         self.latest_dock_stamp = self.get_clock().now()
 
     def on_odom(self, msg: Odometry):
-        # only used to know the robot's own position for the PHASE2 standoff-offset
-        # calculation - PHASE1 leaves all positioning to Nav2.
+        # position: PHASE2 standoff-offset calculation (PHASE1 leaves all positioning to Nav2).
+        # yaw: base heading for the PHASE2 rotate-search sweep when the target is lost.
         p = msg.pose.pose.position
         self.latest_odom_xy = (p.x, p.y)
+        self.latest_odom_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
+
+    def on_own_cam_info(self, msg: CameraInfo):
+        self.own_cam_K = (msg.k[0], msg.k[4], msg.k[2], msg.k[5])  # fx, fy, cx, cy
+        self.own_cam_frame_id = msg.header.frame_id
 
     def on_oakd_synced(self, rgb_msg: CompressedImage, depth_msg: CompressedImage):
         frame = self.bridge.compressed_imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
@@ -263,6 +303,7 @@ class ChaseControllerNode(Node):
                 self.own_cam_confirm_count = min(self.own_cam_confirm_count + 1, self.own_cam_confirm_frames)
             else:
                 self.own_cam_confirm_count = 0
+            self._update_own_cam_world_fallback(now)
         else:
             self.locked_track_id = None
             self.own_cam_confirm_count = 0
@@ -325,30 +366,95 @@ class ChaseControllerNode(Node):
         """PHASE2: still webcam-driven, like PHASE1, but the goal is offset back along
         the robot->target line by target_distance so the robot stops short of the car
         instead of driving into it. Requires knowing our own position (from odom) to
-        compute that offset."""
+        compute that offset. Falls back to the own-camera depth-derived world position
+        (_update_own_cam_world_fallback) when the webcam target goes stale - e.g. the
+        car is close enough that it's out of the fixed webcam's view but still visible
+        to the robot's own depth camera."""
         webcam_fresh = (
             self.latest_webcam_target is not None and self.latest_webcam_stamp is not None
             and (now - self.latest_webcam_stamp) <= Duration(seconds=self.webcam_stale_timeout)
         )
-        if not webcam_fresh or self.latest_odom_xy is None:
-            self._cancel_nav2_goal_if_active()
+        own_cam_world_fresh = (
+            self.latest_own_cam_world_xy is not None and self.latest_own_cam_world_stamp is not None
+            and (now - self.latest_own_cam_world_stamp) <= Duration(seconds=self.depth_stale_timeout)
+        )
+
+        if webcam_fresh:
+            self._search_active = False
+            target_x, target_y = self.latest_webcam_target.x, self.latest_webcam_target.y
+        elif own_cam_world_fresh:
+            self._search_active = False
+            self.get_logger().info(
+                'PHASE2: webcam target stale, following via own-camera depth instead',
+                throttle_duration_sec=2.0,
+            )
+            target_x, target_y = self.latest_own_cam_world_xy
+        else:
+            self._enter_search_mode(now)
             return
 
-        target_x = self.latest_webcam_target.x
-        target_y = self.latest_webcam_target.y
+        if self.latest_odom_xy is None:
+            self._cancel_nav2_goal_if_active()
+            return
         robot_x, robot_y = self.latest_odom_xy
         dx = target_x - robot_x
         dy = target_y - robot_y
         dist = math.hypot(dx, dy)
 
         if dist <= self.target_distance:
-            return  # already within the standoff distance - hold, don't crowd the car
+            # already within the standoff distance - cancel any in-flight approach goal
+            # so the robot doesn't keep coasting forward on stale momentum and crowd the car.
+            self._cancel_nav2_goal_if_active()
+            return
 
         ratio = (dist - self.target_distance) / dist
         goal_x = robot_x + dx * ratio
         goal_y = robot_y + dy * ratio
         yaw = math.atan2(dy, dx)
-        self._maybe_send_nav2_goal(goal_x, goal_y, yaw=yaw)
+        self._maybe_send_nav2_goal(goal_x, goal_y, yaw=yaw, threshold=self.phase2_goal_update_threshold_m)
+
+    def _enter_search_mode(self, now):
+        """PHASE2 target lost on both webcam and own-camera fallback: sweep the robot's
+        heading back and forth between -search_sweep_deg and +search_sweep_deg (relative
+        to the heading it had when it lost the target) via small in-place-rotation Nav2
+        goals, until either source reacquires the car. Bypasses _maybe_send_nav2_goal's
+        XY-distance resend gate since these goals share the same (x, y) and only the
+        yaw changes between sends."""
+        if self.latest_odom_xy is None or self.latest_odom_yaw is None:
+            self._cancel_nav2_goal_if_active()
+            return
+
+        if not self._search_active:
+            self._search_active = True
+            self._search_base_yaw = self.latest_odom_yaw
+            self._search_toggle = False
+            self._search_last_sent_time = None
+            self.get_logger().warn(
+                f'PHASE2: target lost on both sources - rotate-search '
+                f'(+/-{self.search_sweep_deg:.0f} deg)'
+            )
+
+        due = (
+            self._search_last_sent_time is None
+            or (now - self._search_last_sent_time) >= Duration(seconds=self.search_goal_resend_interval_sec)
+        )
+        if not due:
+            return
+
+        sign = 1.0 if self._search_toggle else -1.0
+        target_yaw = self._search_base_yaw + sign * math.radians(self.search_sweep_deg)
+        self._search_toggle = not self._search_toggle
+        self._search_last_sent_time = now
+
+        if not self.enable_cmd_vel:
+            self.get_logger().info(
+                f'[DRY RUN] would send search-rotation goal to yaw={math.degrees(target_yaw):.0f} deg',
+                throttle_duration_sec=1.0,
+            )
+            return
+
+        x, y = self.latest_odom_xy
+        self._send_nav2_goal(x, y, yaw=target_yaw)
 
     def _sample_depth_at_bbox_center(self, now=None):
         if self.latest_own_cam_bbox is None or self.latest_depth_image is None:
@@ -358,6 +464,48 @@ class ChaseControllerNode(Node):
         x1, y1, x2, y2 = self.latest_own_cam_bbox
         u, v = int((x1 + x2) / 2), int((y1 + y2) / 2)
         return sample_depth_patch(self.latest_depth_image, u, v, self.depth_patch_size, self.depth_scale)
+
+    def _update_own_cam_world_fallback(self, now):
+        """PHASE2 fallback source: project the own-camera bbox+depth into a 3D point in
+        the camera frame, then TF-transform it into nav2_goal_frame_id, for when the
+        webcam can't see the car (e.g. it's right in front of the robot, out of the
+        fixed webcam's view) but the robot's own depth camera still can."""
+        if self.own_cam_K is None or self.own_cam_frame_id is None:
+            self.get_logger().warn(
+                f'own-cam world fallback unavailable: no CameraInfo received yet on '
+                f'{self.own_cam_info_topic} - check the topic name/QoS if this persists',
+                throttle_duration_sec=5.0,
+            )
+            return
+        z = self._sample_depth_at_bbox_center(now)
+        if z is None:
+            self.get_logger().warn(
+                'own-cam world fallback unavailable: no valid depth at bbox center',
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        x1, y1, x2, y2 = self.latest_own_cam_bbox
+        u = (x1 + x2) / 2.0
+        v = (y1 + y2) / 2.0
+        fx, fy, cx, cy = self.own_cam_K
+
+        pt_cam = PointStamped()
+        pt_cam.header.frame_id = self.own_cam_frame_id
+        # Zero stamp = "use the latest available transform" - same reasoning as the Nav2
+        # goal stamp: avoids extrapolation errors if this lookup is delayed.
+        pt_cam.header.stamp = Time().to_msg()
+        pt_cam.point.x = (u - cx) * z / fx
+        pt_cam.point.y = (v - cy) * z / fy
+        pt_cam.point.z = z
+
+        try:
+            pt_world = self.tf_buffer.transform(pt_cam, self.nav2_goal_frame_id, timeout=Duration(seconds=0.2))
+        except Exception as exc:
+            self.get_logger().warn(f'own-cam depth->world TF transform failed: {exc}', throttle_duration_sec=2.0)
+            return
+        self.latest_own_cam_world_xy = (pt_world.point.x, pt_world.point.y)
+        self.latest_own_cam_world_stamp = now
 
     def _publish_handoff_event(self):
         """Fire a brief RViz marker at the robot's own location when PHASE1 -> PHASE2
@@ -408,13 +556,16 @@ class ChaseControllerNode(Node):
         self._explore_resume_published = want_resume
         self.get_logger().info(f'EXPLORE: resume={want_resume}')
 
-    def _maybe_send_nav2_goal(self, x, y, yaw=None):
+    def _maybe_send_nav2_goal(self, x, y, yaw=None, threshold=None):
+        if threshold is None:
+            threshold = self.nav2_goal_update_threshold_m  # PHASE1 long-range default
+
         if self._nav2_goal_pending:
             return  # still waiting on accept/reject for a previous send
 
         if self._nav2_last_goal_xy is not None:
             moved = math.hypot(x - self._nav2_last_goal_xy[0], y - self._nav2_last_goal_xy[1])
-            if moved < self.nav2_goal_update_threshold_m:
+            if moved < threshold:
                 return  # target hasn't moved enough - let the current goal keep running
 
         if not self.enable_cmd_vel:
